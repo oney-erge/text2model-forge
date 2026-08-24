@@ -5,7 +5,7 @@ type: software
 authors:
   - family-names: "Erge"
     given-names: "Oney"
-repository-code: "https://github.com/iodriller/text2model-forge"
-url: "https://github.com/iodriller/text2model-forge"
+repository-code: "https://github.com/oney-erge/text2model-forge"
+url: "https://github.com/oney-erge/text2model-forge"
 version: "0.2.0-rc.1"
 license: "Apache-2.0"

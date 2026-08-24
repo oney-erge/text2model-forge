@@ -12,7 +12,7 @@ LABEL org.opencontainers.image.title="Text2Model Forge" \
     org.opencontainers.image.description="Auditable, human-gated orchestration for local AI-assisted 3D assets" \
     org.opencontainers.image.licenses="Apache-2.0" \
     org.opencontainers.image.version="0.2.0-rc.1" \
-    org.opencontainers.image.source="https://github.com/iodriller/text2model-forge" \
+    org.opencontainers.image.source="https://github.com/oney-erge/text2model-forge" \
     org.opencontainers.image.revision=${TEXT2MODEL_FORGE_SOURCE_REVISION}
 
 WORKDIR /app

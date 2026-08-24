@@ -1,5 +1,5 @@
 blank_issues_enabled: false
 contact_links:
   - name: Private security report
-    url: https://github.com/iodriller/text2model-forge/security/advisories/new
+    url: https://github.com/oney-erge/text2model-forge/security/advisories/new
     about: Do not disclose vulnerabilities or credentials in a public issue.

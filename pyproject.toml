@@ -11,7 +11,7 @@ requires-python = ">=3.12"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE", "THIRD_PARTY_LICENSES.md"]
 authors = [
-  { name = "Oney Erge", email = "48371335+iodriller@users.noreply.github.com" },
+  { name = "Oney Erge", email = "48371335+oney-erge@users.noreply.github.com" },
 ]
 keywords = ["3d", "asset-pipeline", "blender", "comfyui", "human-in-the-loop", "provenance"]
 classifiers = [
@@ -55,10 +55,10 @@ text2model-forge = "text2model_forge.cli:main"
 text2model-sprites = "text2model_forge.sprites.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/iodriller/text2model-forge"
-Documentation = "https://github.com/iodriller/text2model-forge#readme"
-Issues = "https://github.com/iodriller/text2model-forge/issues"
-Source = "https://github.com/iodriller/text2model-forge"
+Homepage = "https://github.com/oney-erge/text2model-forge"
+Documentation = "https://github.com/oney-erge/text2model-forge#readme"
+Issues = "https://github.com/oney-erge/text2model-forge/issues"
+Source = "https://github.com/oney-erge/text2model-forge"
 
 [tool.setuptools.packages.find]
 where = ["src"]
