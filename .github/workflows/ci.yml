@@ -64,7 +64,11 @@ jobs:
             pwsh -NoProfile -Command '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./text2model-forge.ps1), [ref]$null, [ref]$errors); if ($errors.Count) { $errors | Format-List | Out-String | Write-Error }'
           else
             bash -n ./run.sh ./run.command ./text2model-forge.sh
-            shellcheck --severity=error ./run.sh ./run.command
+            if command -v shellcheck >/dev/null 2>&1; then
+              shellcheck --severity=error ./run.sh ./run.command
+            else
+              echo "::notice::shellcheck is unavailable on ${RUNNER_OS}; bash syntax checks passed."
+            fi
           fi
 
       - name: Native core launcher installs from its lock and runs its smoke test
