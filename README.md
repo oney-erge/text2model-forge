@@ -73,6 +73,11 @@ forwarded straight through to the full launcher below, so `.\run.ps1 doctor`
 or `./run.sh install --ai-stack qwen --accept-sdxl-license` both work.
 
 The core install opens a guided offline walkthrough from the first-run page.
+
+The root launchers expose the same operational vocabulary everywhere:
+`run` (the default), `doctor`, `repair`, `docker`, `logs`, and `stop`. On
+Windows use `run.bat` or `run.ps1`; on macOS use `run.command`; on Linux use
+`run.sh`. The Docker launcher waits for Studio to answer before opening it.
 It creates a completed sample project with deterministic local PNG and GLB
 artifacts, explicit synthetic-evidence labels, recorded gates, and provenance.
 Use it to learn the interface before downloading a model stack. It is not a

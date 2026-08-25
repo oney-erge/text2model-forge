@@ -1,26 +1,44 @@
-# Text2Model Forge - one-command launcher on Windows.
-#
-# Usage:
-#   .\run.ps1                    -> install (if needed) + start Studio, core stack (fast, no model downloads)
-#   .\run.ps1 doctor              -> readiness report
-#   .\run.ps1 -AiStack qwen -AcceptSdxlLicense -AcceptHunyuanLicense
-#                                 -> full local AI stack; every option is text2model-forge.ps1's
-#
-# This is a thin front door, not a second installer: every argument is
-# forwarded to text2model-forge.ps1, which does the real work and is already
-# idempotent (re-run any time; it repairs what's missing and starts Studio)
-# with its own bounded install retries. The only thing this script decides is
-# the default AI stack -- "core" here, so a first run is fast and does not
-# reach for a GPU or download anything -- and only when you have not already
-# named one yourself.
-
+# Stable Windows entry point for native and Docker operation.
 $ErrorActionPreference = "Stop"
 Set-Location $PSScriptRoot
 
-$forwardArgs = [string[]]$args
-if (-not ($forwardArgs -contains "-AiStack")) {
-    $forwardArgs = @("-AiStack", "core") + $forwardArgs
+$forwardArgs = [Collections.Generic.List[string]]::new()
+$forwardArgs.AddRange([string[]]$args)
+$action = if ($forwardArgs.Count -gt 0 -and $forwardArgs[0] -in @("run", "doctor", "repair", "docker", "stop", "logs")) {
+    $value = $forwardArgs[0]
+    $forwardArgs.RemoveAt(0)
+    $value
+} else { "run" }
+$noBrowser = $forwardArgs -contains "--no-browser" -or $forwardArgs -contains "-NoBrowser"
+$url = "http://127.0.0.1:8766"
+
+function Wait-Studio {
+    for ($attempt = 0; $attempt -lt 120; $attempt++) {
+        try { Invoke-WebRequest -UseBasicParsing -Uri "$url/doctor" -TimeoutSec 2 | Out-Null; return $true }
+        catch { Start-Sleep -Milliseconds 500 }
+    }
+    return $false
 }
 
-& (Join-Path $PSScriptRoot "text2model-forge.ps1") @forwardArgs
+if ($action -in @("docker", "stop", "logs")) {
+    if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw "Docker is not installed." }
+    docker info *> $null
+    if ($LASTEXITCODE -ne 0) { throw "Docker is installed but its engine is not running." }
+    if ($action -eq "stop") { docker compose down; exit $LASTEXITCODE }
+    if ($action -eq "logs") { docker compose logs --follow; exit $LASTEXITCODE }
+    docker compose up --detach --build
+    if (-not (Wait-Studio)) { docker compose logs studio; throw "Text2Model Forge did not become ready at $url." }
+    Write-Host "Text2Model Forge is ready at $url" -ForegroundColor Green
+    if (-not $noBrowser) { Start-Process $url }
+    exit 0
+}
+
+if ($action -ne "run") { $forwardArgs.Insert(0, $action) }
+if (-not ($forwardArgs -contains "-AiStack") -and -not ($forwardArgs -contains "--ai-stack")) {
+    $insertAt = if ($action -eq "run") { 0 } else { 1 }
+    $forwardArgs.Insert($insertAt, "core")
+    $forwardArgs.Insert($insertAt, "-AiStack")
+}
+$argumentArray = $forwardArgs.ToArray()
+& powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File (Join-Path $PSScriptRoot "text2model-forge.ps1") @argumentArray
 exit $LASTEXITCODE

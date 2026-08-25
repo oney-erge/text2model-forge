@@ -100,15 +100,18 @@ def test_run_wrapper_scripts_forward_to_the_real_launchers_with_a_fast_default_s
     the real, already-tested launcher."""
     ps1 = RUN_PS1.read_text(encoding="utf-8")
     assert 'Join-Path $PSScriptRoot "text2model-forge.ps1"' in ps1
-    assert '"-AiStack", "core"' in ps1
+    assert '$forwardArgs.Insert($insertAt, "-AiStack")' in ps1
+    assert '$forwardArgs.Insert($insertAt, "core")' in ps1
     assert "-contains \"-AiStack\"" in ps1
     assert "$forwardArgs" in ps1
+    assert "docker compose up --detach --build" in ps1
 
     sh = RUN_SH.read_text(encoding="utf-8")
     assert sh.startswith("#!/usr/bin/env bash")
     assert "exec ./text2model-forge.sh" in sh
     assert "--ai-stack core" in sh
-    assert '"$arg" = "--ai-stack"' in sh
+    assert '"$arg" = --ai-stack' in sh
+    assert "docker compose up --detach --build" in sh
 
 
 def test_run_ps1_wrapper_parses_when_powershell_is_available() -> None:
