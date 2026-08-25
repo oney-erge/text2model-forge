@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+import email
 import html
 import json
 import mimetypes
@@ -20,8 +21,10 @@ from .hardware import detect_hardware, recommend_stack
 from .manifests import load_manifests, preflight
 from .settings import profiles_dir, resolve_settings, studio_overrides
 from .studio_models import utc_now
+from .studio_application import StudioApplication
 from .studio_pipeline import StudioCoordinator
-from .studio_store import StudioStore
+from .studio_store import StudioConflictError, StudioStore
+from .studio_ui_assets import MODERN_STYLE
 
 
 STYLE = """
@@ -34,18 +37,67 @@ STYLE = """
 .bar.overall{height:12px;margin:8px 0 4px}.bar span{background:linear-gradient(90deg,var(--accent),#f0a154);transition:width .35s ease}.progress-label{display:flex;justify-content:space-between;gap:12px;color:var(--muted);font-size:13px}select{width:100%;padding:11px;border:1px solid var(--line);border-radius:7px;background:#0d1417;color:var(--text)}.options{margin-top:18px;border:1px solid var(--line);border-radius:9px;padding:12px;background:#10191d}.options summary{cursor:pointer;font-weight:650}.option-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:4px 14px}.service-status{margin-top:10px;padding:9px 11px;border-radius:7px;background:#0d1417}.service-status.good{border-left:3px solid var(--ok)}.service-status.warning{border-left:3px solid var(--wait)}
 .bar.gpu span{background:linear-gradient(90deg,var(--steel),#75bdd9)}
 .glb-preview{display:block;width:100%;height:420px;touch-action:none;cursor:grab;background:radial-gradient(circle,#263238,#080c0e 70%);border:1px solid var(--line);border-radius:8px}.glb-preview:active{cursor:grabbing}.viewer-note{font-size:12px;color:var(--muted)}
-@media(max-width:800px){.wrap{padding:15px}header{padding:14px}.hero{padding:18px}}
+header{border-bottom-color:var(--line)}header .logo{flex:none;border-radius:7px}header h1{letter-spacing:.08em;font-weight:650}header a{padding:6px 2px;border-bottom:2px solid transparent}header a:hover,header a:focus-visible{color:var(--text);border-bottom-color:var(--accent)}
+.active-runs{margin-left:auto;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;max-width:46vw}
+.active-run-chip{display:flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;background:#10191d;border:1px solid var(--line);color:var(--text);text-decoration:none;font-size:12px;max-width:220px}
+.active-run-chip:hover,.active-run-chip:focus-visible{border-color:var(--accent)}
+.active-run-chip span.title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.active-run-chip small{color:var(--muted);white-space:nowrap}
+.active-run-chip .dot{flex:none;width:7px;height:7px;border-radius:50%;background:var(--steel)}
+.active-run-chip.awaiting_review .dot{background:var(--wait)}
+.hint{display:inline-flex;align-items:center;justify-content:center;width:15px;height:15px;border-radius:50%;background:#253239;color:var(--muted);font-size:11px;font-weight:700;font-style:normal;cursor:help;position:relative;margin-left:5px;vertical-align:middle}
+.hint:hover,.hint:focus-visible{background:var(--steel);color:#fff;outline:none}
+.hint .tip{visibility:hidden;opacity:0;position:absolute;bottom:calc(100% + 7px);left:0;width:230px;background:#0d1417;border:1px solid var(--line);border-radius:7px;padding:9px 11px;font-size:12px;font-weight:400;color:var(--text);line-height:1.45;z-index:5;box-shadow:0 8px 20px #0007;transition:opacity .12s ease}
+.hint:hover .tip,.hint:focus-visible .tip{visibility:visible;opacity:1}
+.checking{color:var(--muted);animation:pulse 1.6s ease-in-out infinite}
+.bar.indeterminate{height:5px;overflow:hidden}
+.bar.indeterminate span{width:38%;background:linear-gradient(90deg,transparent,var(--accent),transparent);animation:slide 1.5s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.55}}
+@keyframes slide{0%{transform:translateX(-100%)}100%{transform:translateX(300%)}}
+@media(prefers-reduced-motion:reduce){.checking,.bar.indeterminate span{animation:none}.bar.indeterminate span{width:100%}}
+@media(max-width:800px){.wrap{padding:15px}header{padding:14px}.hero{padding:18px}.active-runs{display:none}}
 """
+
+
+# A small bolt: forging is a heat/spark process, and a bolt reads clearly
+# at 16px in a browser tab, which an anvil or hammer silhouette does not.
+# Shared between the header wordmark and the /favicon.ico route so both
+# stay in sync with one edit.
+_LOGO_SVG_BODY = (
+    '<rect x="2" y="2" width="28" height="28" rx="7" fill="#182126" '
+    'stroke="#45728b" stroke-width="2"/>'
+    '<path d="M17 6 9 18h5l-1.5 8L22 14h-5l2-8z" fill="#dc6837"/>'
+)
+_FAVICON = (
+    f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">{_LOGO_SVG_BODY}</svg>'
+).encode("utf-8")
 
 
 def _page(title: str, body: str) -> bytes:
     return (
-        "<!doctype html><html><head><meta charset=utf-8>"
+        '<!doctype html><html lang="en"><head><meta charset=utf-8>'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        f"<title>{html.escape(title)}</title><style>{STYLE}</style></head>"
-        '<body><header><h1>Text2Model Forge Studio</h1><a href="/">Runs</a><a href="/new">New asset</a>'
-        '<a href="/golden">Golden corpus</a><a href="/doctor">System</a></header><main class="wrap">'
-        f'{body}</main><script src="/static/glb-viewer.js" defer></script></body></html>'
+        f"<title>{html.escape(title)}</title>"
+        '<link rel="icon" href="/favicon.ico" type="image/svg+xml">'
+        f"<style>{MODERN_STYLE}</style></head>"
+        '<body><a class="skip-link" href="#main-content">Skip to content</a>'
+        '<header class="app-header"><div class="header-inner">'
+        '<a class="brand" href="/" aria-label="Text2Model Forge Studio home">'
+        f'<svg class=logo viewBox="0 0 32 32" width="28" height="28" aria-hidden="true">{_LOGO_SVG_BODY}</svg>'
+        '<span class="brand-text">Text2Model Forge</span><span class="brand-kicker">Studio</span></a>'
+        '<nav class="desktop-nav" aria-label="Primary">'
+        '<a href="/">Projects</a><a href="/new">Create</a><a href="/doctor">System</a>'
+        '<details class="nav-popover"><summary>Developer</summary><div class="nav-popover-menu">'
+        '<a href="/golden">Golden corpus</a><a href="/api/v1/projects">Projects API</a>'
+        '</div></details></nav>'
+        '<div id=active-runs class=active-runs aria-live=polite aria-label="Active projects"></div>'
+        '<details class="mobile-nav"><summary aria-label="Open navigation">Menu</summary>'
+        '<nav class="nav-popover-menu" aria-label="Mobile">'
+        '<a href="/">Projects</a><a href="/new">Create</a><a href="/doctor">System</a>'
+        '<a href="/golden">Golden corpus</a></nav></details>'
+        '</div></header><main id="main-content" class="wrap">'
+        f'{body}</main><script src="/static/glb-viewer.js" defer></script>'
+        '<script src="/static/active-runs.js" defer></script></body></html>'
     ).encode("utf-8")
 
 
@@ -143,11 +195,55 @@ STUDIO_JS = """
     });
   }
 
+  // One condition, one sentence. This used to concatenate four independent
+  // fragments -- two raw service details plus two "required files not all
+  // detected" lines -- so a machine with nothing installed yet reported
+  // what read as four separate errors for what is really one state: the
+  // local AI services have not been started.
+  function describeServices(data) {
+    var down = [];
+    if (!data.services.reviewer.ready) down.push('the reviewer model');
+    if (!data.services.comfyui.ready) down.push('ComfyUI');
+    if (down.length > 1) {
+      return {
+        ok: false,
+        text: 'No local AI services are running yet, so a run cannot start. The System page '
+          + 'lists exactly what to start.'
+      };
+    }
+    if (down.length === 1) {
+      return {
+        ok: false,
+        text: down[0].charAt(0).toUpperCase() + down[0].slice(1)
+          + ' is not running, so a run cannot start. The System page has the command.'
+      };
+    }
+    var installed = [];
+    if (data.qwen_image_2512_ready) installed.push('Qwen Image 2512');
+    if (data.z_image_turbo_ready) installed.push('Z-Image Turbo');
+    var text = 'Local AI services are running: ' + data.checkpoints.length + ' checkpoint'
+      + (data.checkpoints.length === 1 ? '' : 's') + ' and ' + data.review_models.length
+      + ' reviewer model' + (data.review_models.length === 1 ? '' : 's') + ' available.';
+    if (installed.length) text += ' Installed here: ' + installed.join(' and ') + '.';
+    return { ok: true, text: text };
+  }
+
   function initSetupOptions() {
     var form = document.querySelector('[data-setup-options]');
     if (!form) return;
     var profile = form.querySelector('[name="profile"]');
     var status = document.getElementById('setup-service-status');
+    var submit = form.querySelector('button[type="submit"]');
+    var submitLabel = submit ? submit.textContent : '';
+
+    // A convenience, not the gate: POST /runs re-checks server-side and
+    // refuses there. So if this probe cannot run at all, leave the button
+    // enabled and let the authoritative check answer.
+    function setSubmitEnabled(enabled) {
+      if (!submit) return;
+      submit.disabled = !enabled;
+      submit.textContent = enabled ? submitLabel : 'Start your AI services first';
+    }
 
     function load() {
       if (status) {
@@ -168,31 +264,111 @@ STUDIO_JS = """
           });
           fillDatalist('installed-checkpoints', data.checkpoints);
           fillDatalist('installed-review-models', data.review_models);
+          var state = describeServices(data);
           if (status) {
-            var ready = data.services.comfyui.ready && data.services.reviewer.ready;
-            status.className = 'service-status ' + (ready ? 'good' : 'warning');
-            status.textContent =
-              'ComfyUI: ' + data.services.comfyui.detail + ' (' + data.checkpoints.length +
-              ' checkpoints, ' + data.diffusion_models.length + ' diffusion models). Reviewer: ' +
-              data.services.reviewer.detail + ' (' + data.review_models.length + ' models). Qwen Image 2512: ' +
-              (data.qwen_image_2512_ready ? 'ready.' : 'required files not all detected.') + ' Z-Image Turbo: ' +
-              (data.z_image_turbo_ready ? 'ready.' : 'required files not all detected.');
+            status.className = 'service-status ' + (state.ok ? 'good' : 'warning');
+            status.textContent = state.text;
           }
+          setSubmitEnabled(state.ok);
         })
         .catch(function () {
           if (status) {
             status.className = 'service-status warning';
             status.textContent = 'Could not inspect local AI services. You can still use profile defaults or type model names.';
           }
+          setSubmitEnabled(true);
         });
     }
 
-    profile.addEventListener('change', load);
+    // The advanced-options panel starts open or closed based on the
+    // server-rendered default profile; switching profiles client-side
+    // should keep that in sync (simple -> collapsed, anything else ->
+    // open) without overriding a manual click the user makes afterward.
+    function syncOptionsVisibility() {
+      var details = form.querySelector('details.options');
+      if (details) details.open = profile.value !== 'simple';
+    }
+
+    profile.addEventListener('change', function () {
+      syncOptionsVisibility();
+      load();
+    });
     load();
   }
 
   initRunProgress();
   initSetupOptions();
+})();
+"""
+
+
+# The System page's checks deliberately wait on services that may not be
+# running -- one ComfyUI probe alone carries a 25 s timeout, and the whole
+# report was measured at ~5.8 s even when every connection is refused
+# instantly. Rendering that synchronously meant the browser sat on a blank
+# request the entire time, so the nav link read as a dead button. The page
+# now returns its shell immediately and fills itself in from /api/doctor,
+# which runs exactly the same checks -- the wait is unchanged, but it is
+# visible and the rest of Studio stays usable during it.
+DOCTOR_JS = """
+(function () {
+  function initDoctor() {
+    var shell = document.getElementById('doctor-shell');
+    if (!shell) return;
+    fetch('/api/doctor', { cache: 'no-store' })
+      .then(function (response) {
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        return response.text();
+      })
+      .then(function (fragment) { shell.outerHTML = fragment; })
+      .catch(function (error) {
+        var status = document.getElementById('doctor-status');
+        if (!status) return;
+        status.className = 'error';
+        status.textContent = 'Could not run the system checks (' + error.message + '). Reload to try again.';
+      });
+  }
+  initDoctor();
+})();
+"""
+
+
+# Loaded on every page (see _page()), unlike STUDIO_JS which only loads on
+# pages that actually need it (a busy run, the New-asset form). This has to
+# be global: the whole point is that a run's progress stays one click away
+# no matter which page you are looking at, not just its own.
+ACTIVE_RUNS_JS = """
+(function () {
+  function escapeHtml(text) {
+    var div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
+  }
+
+  function initActiveRuns() {
+    var container = document.getElementById('active-runs');
+    if (!container) return;
+
+    function render(runs) {
+      container.innerHTML = runs.map(function (run) {
+        var label = run.state === 'awaiting_review' ? 'needs you' : run.current_stage;
+        return '<a class="active-run-chip ' + run.state + '" href="/run/' + encodeURIComponent(run.run_id) + '">' +
+          '<span class=dot></span><span class=title>' + escapeHtml(run.title) + '</span>' +
+          '<small>' + escapeHtml(label) + '</small></a>';
+      }).join('');
+    }
+
+    function poll() {
+      fetch('/api/active-runs', { cache: 'no-store' })
+        .then(function (response) { return response.json(); })
+        .then(function (runs) { render(runs); window.setTimeout(poll, 4000); })
+        .catch(function () { window.setTimeout(poll, 8000); });
+    }
+
+    poll();
+  }
+
+  initActiveRuns();
 })();
 """
 
@@ -278,6 +454,48 @@ def _form(handler: BaseHTTPRequestHandler) -> dict[str, str]:
         raise ValueError("form is too large")
     parsed = parse_qs(handler.rfile.read(length).decode("utf-8"), keep_blank_values=True)
     return {key: values[-1] for key, values in parsed.items()}
+
+
+def _multipart_form(
+    handler: BaseHTTPRequestHandler, *, max_bytes: int
+) -> dict[str, str | tuple[str, bytes]]:
+    """Parse one multipart/form-data POST body, the one request shape _form()
+    cannot handle because it is not urlencoded.
+
+    Built on the standard library's own MIME parser (email.message_from_bytes)
+    rather than a hand-rolled boundary splitter or the deprecated cgi module:
+    this is security-relevant request parsing, so correctness on malformed or
+    adversarial input matters more than brevity. A plain field comes back as
+    its decoded string value; a file field comes back as (filename, bytes).
+    """
+    content_type = handler.headers.get("Content-Type", "")
+    if not content_type.startswith("multipart/form-data"):
+        raise ValueError("expected a multipart/form-data request")
+    try:
+        length = int(handler.headers.get("Content-Length", "0"))
+    except ValueError as exc:
+        handler.close_connection = True
+        raise ValueError("the request had no readable length") from exc
+    if length < 0 or length > max_bytes:
+        # Same reasoning as _form()'s cap: do not read an oversized body,
+        # and do not trust this connection for a further request afterward.
+        handler.close_connection = True
+        raise ValueError("upload is too large")
+    body = handler.rfile.read(length)
+    message = email.message_from_bytes(
+        f"Content-Type: {content_type}\r\nMIME-Version: 1.0\r\n\r\n".encode("ascii") + body
+    )
+    if not message.is_multipart():
+        raise ValueError("malformed multipart request")
+    result: dict[str, str | tuple[str, bytes]] = {}
+    for part in message.get_payload():
+        name = part.get_param("name", header="content-disposition")
+        if not name:
+            continue
+        filename = part.get_filename()
+        payload = part.get_payload(decode=True) or b""
+        result[name] = (filename, payload) if filename is not None else payload.decode("utf-8", "replace")
+    return result
 
 
 def _slug() -> str:
@@ -476,7 +694,7 @@ def _evidence(run, stage, *, allow_selection: bool = True) -> tuple[str, list[st
                 else ""
             )
             details = (
-                "<details><summary>All recorded metrics and content hash</summary>"
+                '<details class="inspection-drawer"><summary>Technical evidence details</summary>'
                 f"<pre>{html.escape(json.dumps({**item.metrics, 'sha256': item.sha256}, indent=2))}</pre></details>"
             )
             if item.media_type.startswith("image/"):
@@ -489,9 +707,9 @@ def _evidence(run, stage, *, allow_selection: bool = True) -> tuple[str, list[st
                 ):
                     checked = " checked" if item.evidence_id == recommended else ""
                     choice = (
-                        f'<label class=choice><input type=radio name=selected_evidence_id '
+                        f'<label class=evidence-select><input form=human-decision type=radio name=selected_evidence_id '
                         f'value="{html.escape(item.evidence_id)}"{checked}>'
-                        f"Select {html.escape(item.label)}</label>"
+                        f"Use {html.escape(item.label)}</label>"
                     )
                     choices.append(choice)
                 body = (
@@ -509,7 +727,7 @@ def _evidence(run, stage, *, allow_selection: bool = True) -> tuple[str, list[st
                 choice = ""
                 body = f'<p><a class=button href="{url}" target=_blank>Open evidence</a></p>'
             cards.append(
-                '<section class="card evidence">'
+                '<section class="card evidence is-candidate">'
                 f"<h3>{html.escape(item.label)} {pick}</h3>{body}"
                 f"{_metric_badges(item.metrics)}{details}{choice}</section>"
             )
@@ -522,7 +740,7 @@ def _evidence(run, stage, *, allow_selection: bool = True) -> tuple[str, list[st
             )
             + "</div>"
         )
-        sections.append(heading + '<div class="grid">' + "".join(cards) + "</div>")
+        sections.append(heading + '<div class="evidence-grid">' + "".join(cards) + "</div>")
     return "".join(sections), choices
 
 
@@ -611,7 +829,7 @@ def _ai_recommendation_form(run, stage, csrf: str) -> str:
     )
 
 
-def _decision_form(run, stage, csrf: str, choices: list[str]) -> str:
+def _legacy_decision_form(run, stage, csrf: str, choices: list[str]) -> str:
     if stage.state != "awaiting_review":
         return ""
     stage_index = next(
@@ -660,6 +878,61 @@ def _decision_form(run, stage, csrf: str, choices: list[str]) -> str:
     )
 
 
+def _decision_form(run, stage, csrf: str, choices: list[str]) -> str:
+    """Focused human gate with infrequent controls behind progressive disclosure."""
+    if stage.state != "awaiting_review":
+        return ""
+    stage_index = next(
+        (index for index, item in enumerate(run.stages) if item.stage_id == stage.stage_id),
+        0,
+    )
+    rollback_targets = [
+        item
+        for item in run.stages[:stage_index]
+        if item.applicable and item.state in {"approved", "skipped", "rejected", "failed"}
+    ]
+    rollback_options = "".join(
+        f'<option value="{html.escape(item.stage_id, quote=True)}">'
+        f'{html.escape(item.stage_id)}: {html.escape(item.label)}</option>'
+        for item in rollback_targets
+    )
+    rollback_block = (
+        '<label for=rollback-target>Roll back to</label>'
+        f'<select id=rollback-target name=target_stage_id>'
+        f'<option value="">Choose an earlier stage</option>{rollback_options}</select>'
+        if rollback_targets
+        else '<input type=hidden name=target_stage_id value="">'
+    )
+    rollback_button = (
+        '<button class=danger name=decision value=rollback type=submit>Roll back</button>'
+        if rollback_targets
+        else ""
+    )
+    return _ai_recommendation_form(run, stage, csrf) + (
+        '<section class=card><p class=eyebrow>Human gate</p><h2>Your decision</h2>'
+        '<p class=muted>Inspect the evidence first. Your choice is stored with the exact evidence hashes.</p>'
+        f'<form id=human-decision method=post action="/run/{html.escape(run.run_id, quote=True)}/decision">'
+        f'<input type=hidden name=csrf value="{html.escape(csrf, quote=True)}">'
+        f'<input type=hidden name=stage_id value="{html.escape(stage.stage_id, quote=True)}">'
+        + '<label for=decision-comment>Review note</label>'
+        '<textarea id=decision-comment name=comment '
+        'placeholder="Say what should change. A note is required when requesting a revision or skipping."></textarea>'
+        '<div class=decision-primary>'
+        '<button class=primary name=decision value=approve type=submit>Approve and continue</button>'
+        '<button class=reject name=decision value=reject type=submit>Request revision</button></div>'
+        '<details class=decision-more><summary>More decision options</summary>'
+        '<label for=decision-overrides>Technical overrides (JSON, optional)</label>'
+        "<textarea id=decision-overrides name=overrides placeholder='For example: {&quot;seed&quot;: 42}'></textarea>"
+        + rollback_block
+        + '<div class=actions><button class=secondary name=decision value=retry type=submit>'
+        'Retry unchanged</button><button class=secondary name=decision value=edit type=submit>'
+        'Edit inputs and retry</button><button class=secondary name=decision value=skip type=submit>'
+        'Mark not applicable</button>'
+        + rollback_button
+        + '</div></details></form></section>'
+    )
+
+
 def _manual_qwen_image_form(run, stage, csrf: str, *, busy: bool) -> str:
     """Offer a direct D1 candidate without bypassing the stored production contract."""
     if stage.stage_id != "D1":
@@ -681,11 +954,35 @@ def _manual_qwen_image_form(run, stage, csrf: str, *, busy: bool) -> str:
         '<span class=badge>50 sampling steps</span><span class=badge>Qwen contract rewrite + critic</span></div>'
         f'<form method=post action="/run/{html.escape(run.run_id)}/qwen-image">'
         f'<input type=hidden name=csrf value="{csrf}">'
-        '<label>Visual prompt</label><textarea name=prompt minlength=12 required '
+        '<label for=direct-prompt>Visual prompt</label><textarea id=direct-prompt name=prompt minlength=12 required '
         'placeholder="Example: hand-painted clockwork courier with a canvas satchel on its left side and a brass lantern in its right hand; neutral studio background, clear proportions."></textarea>'
-        '<label>Optional deterministic seed</label><input type=number name=seed min=0 step=1 placeholder="Leave blank for a fresh random seed">'
+        '<label for=direct-seed>Optional deterministic seed</label><input id=direct-seed type=number name=seed min=0 step=1 placeholder="Leave blank for a fresh random seed">'
         '<div class=prompt-tools><button class=primary type=submit>Render direct Qwen candidate</button>'
         '<button class=secondary type=reset>Clear prompt and seed</button></div></form></section>'
+    )
+
+
+def _upload_image_form(run, stage, csrf: str, *, busy: bool) -> str:
+    """Offer an uploaded image as a D1 candidate, through the same gate as any other."""
+    if stage.stage_id != "D1":
+        return ""
+    if busy or stage.state != "awaiting_review":
+        return (
+            '<section class="card console"><h2>Upload your own concept image</h2>'
+            '<p class=muted>An upload is available when this concept gate is waiting for review.</p></section>'
+        )
+    return (
+        '<section class="card console"><div class=console-head><div><h2>Upload your own concept image</h2>'
+        '<p class=muted>Skip generation and supply the D1 candidate yourself.</p></div>'
+        '<span class="badge recommended">ready</span></div>'
+        '<p>Use art you already have instead of generating a new candidate. It goes through the same '
+        f'isolation and quality gate every generated concept does{_hint("Studio isolates the subject by flood-filling a mostly green, edge-connected background inward from the border -- the same check every generated concept passes. An image on a plain white, textured, or busy background will likely fail it; the fastest fix is compositing your art onto a flat green backdrop before uploading.")} '
+        '-- render or place your subject on a clean, mostly green background before uploading.</p>'
+        f'<form method=post action="/run/{html.escape(run.run_id)}/upload-image" enctype=multipart/form-data>'
+        f'<input type=hidden name=csrf value="{csrf}">'
+        '<label for=concept-upload>Image file</label><input id=concept-upload type=file name=image accept="image/*" required>'
+        '<div class=prompt-tools><button class=primary type=submit>Upload as a candidate</button></div>'
+        '</form></section>'
     )
 
 
@@ -745,6 +1042,14 @@ def _studio_controls(run, stage, coordinator: StudioCoordinator, csrf: str, *, b
 # that was never installed. Heuristic, not exhaustive -- worst case a real
 # bug's error just doesn't get the extra link, which is what happened for
 # every failure before this existed.
+#
+# "urlopen error" is the one addition worth calling out: every network
+# reachability check in this codebase goes through urllib, and URLError's
+# own __str__ always renders as "<urlopen error ...>" regardless of the
+# underlying OS message -- a Linux "Connection refused", a Windows
+# "[WinError 10061] ... actively refused it", or a plain socket timeout.
+# Matching that wrapper catches all of them at the source instead of
+# enumerating each platform's wording one at a time.
 _DEPENDENCY_ERROR_HINTS = (
     "not installed",
     "is required",
@@ -754,6 +1059,8 @@ _DEPENDENCY_ERROR_HINTS = (
     "executable",
     "not reachable",
     "connection refused",
+    "urlopen error",
+    "actively refused",
 )
 
 
@@ -849,7 +1156,7 @@ def _stage_page(store: StudioStore, run_id: str, stage_id: str) -> str:
     )
 
 
-def _run_page(store: StudioStore, coordinator: StudioCoordinator, run_id: str, csrf: str) -> str:
+def _legacy_run_page(store: StudioStore, coordinator: StudioCoordinator, run_id: str, csrf: str) -> str:
     run = store.load(run_id)
     stage = run.stage(run.current_stage)
     evidence, choices = _evidence(run, stage)
@@ -916,11 +1223,236 @@ def _run_page(store: StudioStore, coordinator: StudioCoordinator, run_id: str, c
         f"{_studio_controls(run, stage, coordinator, csrf, busy=busy)}"
         f"<h2 style='margin-top:22px'>Evidence</h2>{evidence}"
         f"{_manual_qwen_image_form(run, stage, csrf, busy=busy)}"
+        f"{_upload_image_form(run, stage, csrf, busy=busy)}"
         f"{_decision_form(run, stage, csrf, choices)}"
         f'<section class=card style="margin-top:16px"><h2>Run history</h2><div class=events>{event_html}</div></section>'
         + ('<script src="/static/studio.js" defer></script>' if busy else "")
     )
     return body
+
+
+_USER_PHASES = (
+    ("Brief", ("D0",)),
+    ("Concept", ("D1",)),
+    ("Geometry", ("D2", "D3")),
+    ("Structure", ("D4", "D5", "D6", "D7")),
+    ("Surface", ("D8", "D9")),
+    ("Validate", ("D10",)),
+)
+
+
+def _phase_rail(run, active_stage_id: str) -> str:
+    rows = []
+    for number, (label, stage_ids) in enumerate(_USER_PHASES, start=1):
+        phase_stages = [item for item in run.stages if item.stage_id in stage_ids]
+        applicable = [item for item in phase_stages if item.applicable]
+        is_active = active_stage_id in stage_ids
+        if any(item.state == "awaiting_review" for item in applicable):
+            state = "awaiting_review"
+            state_text = "Needs review"
+        elif any(item.state in {"failed", "blocked", "rejected"} for item in applicable):
+            state = "failed"
+            state_text = "Stopped"
+        elif applicable and all(item.state in {"approved", "skipped"} for item in applicable):
+            state = "approved"
+            state_text = "Complete"
+        elif any(item.state in {"running", "queued"} for item in applicable):
+            state = "running"
+            state_text = "In progress"
+        elif not applicable:
+            state = "skipped"
+            state_text = "Not needed"
+        else:
+            state = "pending"
+            state_text = "Upcoming"
+        target = next(
+            (item for item in reversed(phase_stages) if item.applicable),
+            phase_stages[0],
+        )
+        href = (
+            f"/run/{quote(run.run_id)}"
+            if is_active
+            else _stage_url(run.run_id, target.stage_id)
+        )
+        classes = f"phase-link {state}" + (" active" if is_active else "")
+        rows.append(
+            f'<a class="{classes}" href="{href}"><span class=phase-dot>{number}</span>'
+            f'<span><strong>{html.escape(label)}</strong><small>{html.escape(state_text)}</small></span></a>'
+        )
+    return (
+        '<section class=card><p class=eyebrow>Workflow</p>'
+        f'<nav class=phase-list aria-label="Project phases">{"".join(rows)}</nav></section>'
+    )
+
+
+def _completion_panel(run) -> str:
+    final_stage = run.stage("D10")
+    models = [
+        item
+        for item in final_stage.evidence
+        if item.media_type in {"model/gltf-binary", "model/gltf+json"}
+        or item.relative_path.lower().endswith(".glb")
+    ]
+    final_model = models[-1] if models else None
+    links = "".join(
+        f'<a class="button secondary" href="{_artifact_url(run.run_id, item.relative_path)}" target=_blank>'
+        f'Open {html.escape(item.label)}</a>'
+        for item in final_stage.evidence
+        if item is not final_model
+    )
+    if final_model is None:
+        preview = '<p class=muted>The completion record does not contain a final GLB.</p>'
+        download = ""
+    else:
+        url = _artifact_url(run.run_id, final_model.relative_path)
+        preview = (
+            f'<canvas class=glb-preview data-glb-src="{url}" '
+            f'aria-label="Interactive preview of {html.escape(final_model.label, quote=True)}"></canvas>'
+            '<p class=viewer-note>Drag to orbit and use the wheel to zoom.</p>'
+        )
+        download = f'<a class="button primary" href="{url}" download>Download final GLB</a>'
+    return (
+        '<section class="card completion"><p class=eyebrow>Build complete</p>'
+        '<h2>Your validated asset is ready</h2>'
+        '<p>The final package remains connected to the evidence and decisions that produced it.</p>'
+        f'{preview}<div class=hero-actions>{download}{links}</div></section>'
+    )
+
+
+def _run_page(store: StudioStore, coordinator: StudioCoordinator, run_id: str, csrf: str) -> str:
+    run = store.load(run_id)
+    stage = run.stage(run.current_stage)
+    evidence, choices = _evidence(run, stage)
+    events = store.read_events(run_id)[-30:]
+    busy = coordinator.busy(run_id) or run.state == "running"
+    work_detail = html.escape(stage.progress_phase)
+    if stage.progress_total:
+        work_detail += (
+            f" · {stage.progress_current}/{stage.progress_total} "
+            f"{html.escape(stage.progress_unit)}"
+        )
+    gpu_fraction = (
+        min(1.0, (stage.gpu_used_gb or 0.0) / stage.gpu_total_gb)
+        if stage.gpu_total_gb
+        else 0.0
+    )
+    gpu_label = (
+        f"{stage.gpu_used_gb or 0.0:.2f}/{stage.gpu_total_gb:.2f} GiB"
+        if stage.gpu_total_gb
+        else "Waiting for telemetry"
+    )
+    overall_progress = _run_progress(run)
+    error = _error_block(stage)
+    resume = ""
+    if run.state in {"failed", "blocked", "created"} and not coordinator.busy(run_id):
+        resume = (
+            f'<form method=post action="/run/{html.escape(run_id, quote=True)}/resume">'
+            f'<input type=hidden name=csrf value="{html.escape(csrf, quote=True)}">'
+            '<button class=primary type=submit>Resume build</button></form>'
+        )
+    tutorial_notice = (
+        '<div class="notice tutorial"><strong>Offline tutorial.</strong> This completed example uses '
+        'deterministic synthetic evidence. It teaches the interface and is not qualification evidence.</div>'
+        if run.run_mode == "tutorial"
+        else ""
+    )
+    event_html = "".join(
+        f'<div class=event><strong>{html.escape(item["event_type"])}</strong> '
+        f'<span class=muted>{html.escape(item["occurred_at"])}</span><br>'
+        f'<small>{html.escape(json.dumps(item["payload"], default=str))}</small></div>'
+        for item in reversed(events)
+    )
+    completion = _completion_panel(run) if run.state == "completed" else ""
+    stage_status = (
+        "Waiting for your decision"
+        if stage.state == "awaiting_review"
+        else stage.state.replace("_", " ").title()
+    )
+    active_card = (
+        '<section class=card>'
+        f'<div class=section-head><div><p class=eyebrow>Current stage</p>'
+        f'<h2><a href="{_stage_url(run.run_id, stage.stage_id)}">'
+        f'{html.escape(stage.stage_id)}: {html.escape(stage.label)}</a></h2></div>'
+        f'<span class="badge{" needs" if stage.state == "awaiting_review" else ""}">'
+        f'{html.escape(stage_status)}</span></div>'
+        f'<p id=stage-message>{html.escape(stage.message)}</p>{error}{resume}'
+        f'<div class=progress-label><span>Active work</span><span id=stage-work>{work_detail}</span></div>'
+        f'{_progress_bar(stage.progress, label=f"{stage.stage_id} progress", bar_id="active-stage-bar")}'
+        '<div class=progress-label><span>Last observed GPU memory</span>'
+        f'<span id=gpu-run-label>{gpu_label}</span></div>'
+        f'{_progress_bar(gpu_fraction, label="Live GPU memory", bar_id="gpu-run-bar", extra_class="gpu")}'
+        '</section>'
+    )
+    alternative_concepts = ""
+    if stage.stage_id == "D1":
+        alternative_concepts = (
+            '<details class="card advanced-drawer"><summary>Add another concept candidate</summary>'
+            f'{_manual_qwen_image_form(run, stage, csrf, busy=busy)}'
+            f'{_upload_image_form(run, stage, csrf, busy=busy)}</details>'
+        )
+    decision = _decision_form(run, stage, csrf, choices)
+    review = (
+        f'{decision}<section class=card><h2>Review notes</h2>{_qwen_review(stage)}</section>'
+        '<section class=card><details><summary><strong>Production contract</strong></summary>'
+        f'{_spec(run)}</details></section>'
+    )
+    evidence_block = (
+        '<div class=evidence-heading><p class=eyebrow>Evidence</p><h2>Inspect the result</h2></div>'
+        f'{evidence}{alternative_concepts}'
+    )
+    if run.state == "completed":
+        active_card = (
+            '<section class=card><div class=section-head><div><p class=eyebrow>Validation</p>'
+            f'<h2>{html.escape(stage.stage_id)}: {html.escape(stage.label)}</h2></div>'
+            '<span class=badge>Complete</span></div>'
+            f'<p>{html.escape(stage.message)}</p>'
+            f'<p><a href="{_stage_url(run.run_id, stage.stage_id)}">Open the complete D10 record</a></p>'
+            '</section>'
+        )
+        evidence_block = (
+            '<section class=card><p class=eyebrow>Provenance</p><h2>The evidence record is preserved</h2>'
+            '<p>Open the technical stage record to inspect validation metrics, content hashes, and '
+            'the append-only project history. The final download above is the delivery surface.</p>'
+            f'<a class="button secondary" href="{_stage_url(run.run_id, stage.stage_id)}">'
+            'Inspect validation evidence</a></section>'
+        )
+        review = (
+            '<section class=card><p class=eyebrow>Project record</p><h2>Completed</h2>'
+            f'<p>{len(stage.evidence)} final evidence item{"s" if len(stage.evidence) != 1 else ""} recorded.</p>'
+            '</section><section class=card><details><summary><strong>Production contract</strong></summary>'
+            f'{_spec(run)}</details></section>'
+        )
+    technical = (
+        '<details class="card advanced-drawer"><summary>Technical stages and project controls</summary>'
+        '<p class=muted>The D0 to D10 record remains available for audits and debugging.</p>'
+        f'{_timeline(run, active=stage.stage_id, mark_progress_id=False)}'
+        f'{_studio_controls(run, stage, coordinator, csrf, busy=busy)}'
+        f'<h2>Run history</h2><div class=events>{event_html}</div></details>'
+    )
+    return (
+        '<div class=crumb><a href=/>&larr; Projects</a></div>'
+        f'<section class="card hero run-header" data-run-id="{html.escape(run.run_id, quote=True)}" '
+        f'data-state="{html.escape(run.state, quote=True)}" '
+        f'data-current-stage="{html.escape(run.current_stage, quote=True)}">'
+        '<div class=run-summary><p class=eyebrow>3D project</p>'
+        f'<h1>{html.escape(run.title)}</h1><p class=lede>{html.escape(run.description)}</p>'
+        f'<p><span class=badge>{html.escape(run.state)}</span>'
+        + (' <span class=badge>Offline tutorial</span>' if run.run_mode == "tutorial" else "")
+        + (' <span class=badge>Archived</span>' if run.archived else "")
+        + f' <span class=badge>{html.escape(run.run_id)}</span>'
+        + f' <span class=badge>created {html.escape(run.created_at.isoformat(timespec="seconds"))}</span>'
+        + (f' {_duration_badge(stage)}' if stage.started_at else "")
+        + '</p>'
+        '<div class=progress-label><span>Whole pipeline</span>'
+        f'<span id=overall-run-label>{overall_progress:.0%} overall</span></div>'
+        f'{_progress_bar(overall_progress, label="Whole pipeline progress", bar_id="overall-run-bar")}'
+        f'{tutorial_notice}</div></section>'
+        f'{completion}<div class=run-workspace><aside class=stage-rail>{_phase_rail(run, stage.stage_id)}</aside>'
+        f'<div class=workspace-main>{active_card}{evidence_block}</div>'
+        f'<aside class=review-panel>{review}</aside></div>'
+        f'{technical}'
+        + ('<script src="/static/studio.js" defer></script>' if busy else "")
+    )
 
 
 def _run_card(run) -> str:
@@ -942,22 +1474,42 @@ def _run_card(run) -> str:
         item.stage_id == run.current_stage for item in run.stages
     ) else run.stages[0]
     archived_badge = '<span class=badge>Archived</span> ' if run.archived else ""
+    tutorial_badge = (
+        '<span class="badge">Offline tutorial</span> ' if run.run_mode == "tutorial" else ""
+    )
+    preview = next(
+        (
+            item
+            for stage_item in reversed(run.stages)
+            for item in reversed(stage_item.evidence)
+            if item.media_type.startswith("image/")
+        ),
+        None,
+    )
+    thumbnail = (
+        f'<a href="/run/{quote(run.run_id)}"><img class="project-thumb" loading="lazy" '
+        f'src="{_artifact_url(run.run_id, preview.relative_path)}" '
+        f'alt="Preview for {html.escape(run.title, quote=True)}"></a>'
+        if preview is not None
+        else '<div class="project-thumb project-thumb-empty" aria-hidden="true">◇</div>'
+    )
     return (
         '<section class="card run-card">'
+        f'{thumbnail}'
         f'<h2><a href="/run/{quote(run.run_id)}">{html.escape(run.title)}</a></h2>'
-        f'<p>{archived_badge}{attention} <span class=badge>{html.escape(stage.stage_id)} '
+        f'<p>{archived_badge}{tutorial_badge}{attention} <span class=badge>{html.escape(stage.stage_id)} '
         f"{html.escape(stage.label)}</span> <span class=badge>{settled}/{total} stages settled</span></p>"
         f'<div class=progress-label><span>Pipeline progress</span><span>{overall_progress:.0%}</span></div>'
         f'{_progress_bar(overall_progress, label=f"{run.title} pipeline progress")}'
         f"<p>{html.escape(description)}</p>"
         f'<p class=muted>{html.escape(run.run_id)} · profile {html.escape(run.profile)} · '
         f"updated {html.escape(run.updated_at.isoformat(timespec='seconds'))}</p>"
-        f'<a class="button{" primary" if waiting else ""}" href="/run/{quote(run.run_id)}">'
-        f'{"Review now" if waiting else "Open run"}</a></section>'
+        f'<div class="card-action"><a class="button{" primary" if waiting else ""}" href="/run/{quote(run.run_id)}">'
+        f'{"Review now" if waiting else "Open run"}</a></div></section>'
     )
 
 
-def _dashboard(store: StudioStore, *, show_archived: bool = False) -> str:
+def _dashboard(store: StudioStore, csrf: str, *, show_archived: bool = False) -> str:
     # Runs arrive newest-first; float the ones blocked on a human above them,
     # because in a human-gated compiler an idle gate is the only thing that
     # actually stops the machine. Archived runs are hidden by default -- see
@@ -968,16 +1520,6 @@ def _dashboard(store: StudioStore, *, show_archived: bool = False) -> str:
     runs = all_runs if show_archived else [run for run in all_runs if not run.archived]
     runs = sorted(runs, key=lambda item: item.state != "awaiting_review")
     waiting = sum(1 for run in runs if run.state == "awaiting_review")
-    cards = "".join(_run_card(run) for run in runs)
-    if not cards:
-        cards = '<section class=card><h2>No runs yet</h2><p>Describe any asset; Text2Model Forge compiles the production contract.</p><a class="button primary" href=/new>Create asset</a></section>'
-    summary = (
-        f"{len(runs)} run{'' if len(runs) == 1 else 's'}, "
-        f"{waiting} waiting for your decision."
-        if runs
-        else "One description in. Qwen acts, critiques, and mediates bounded corrections; "
-        "deterministic gates preserve evidence and explicit human decisions."
-    )
     toggle = ""
     if archived_count:
         toggle = (
@@ -986,12 +1528,89 @@ def _dashboard(store: StudioStore, *, show_archived: bool = False) -> str:
             if not show_archived
             else '<p class=muted><a href="/">Hide archived runs</a></p>'
         )
-    return (
-        '<section class="card hero"><h1>Asset production runs</h1>'
-        f'<p class=muted>{html.escape(summary)}</p>{toggle}'
-        '<a class="button primary" href=/new>Create asset</a></section>'
-        '<div class=grid style="margin-top:16px">' + cards + "</div>"
+    if not runs:
+        return (
+            '<section class="card hero empty-state"><div><p class=eyebrow>Local 3D production workspace</p>'
+            '<span class=visually-hidden>Asset production runs</span>'
+            '<h1>Turn a written brief into reviewable 3D evidence</h1>'
+            '<p class=lede>Start with a guided offline project, configure your local generation stack, '
+            'or inspect this computer before creating anything.</p>'
+            f'{toggle}'
+            '<div class=choice-grid>'
+            '<article class=choice-card><div class=choice-icon aria-hidden=true>▶</div>'
+            '<h2>Learn the workflow</h2><p>Open a completed cargo-crate project with real local files, '
+            'review decisions, and a downloadable GLB. No model service is required.</p>'
+            '<form method=post action=/demo><input type=hidden name=csrf '
+            f'value="{html.escape(csrf, quote=True)}"><button class="primary block" type=submit>'
+            'Open offline walkthrough</button></form></article>'
+            '<article class=choice-card><div class=choice-icon aria-hidden=true>＋</div>'
+            '<h2>Create an asset</h2><p>Describe the result you need. Studio preserves every candidate, '
+            'review, and human gate as the project moves forward.</p>'
+            '<a class="button block" href=/new>Configure and create</a></article>'
+            '<article class=choice-card><div class=choice-icon aria-hidden=true>✓</div>'
+            '<h2>Check your system</h2><p>See which local services, models, and tools are ready before '
+            'you start a production project.</p>'
+            '<a class="button secondary block" href=/doctor>Check this computer</a></article>'
+            '</div></div></section>'
+        )
+
+    attention_runs = [run for run in runs if run.state == "awaiting_review"]
+    recent_runs = [run for run in runs if run.state != "awaiting_review"]
+    attention = (
+        '<div class=section-head><div><p class=eyebrow>Needs review</p><h2>Your decision is next</h2></div>'
+        f'<p>{len(attention_runs)} waiting for your decision</p></div>'
+        '<div class=project-grid>' + "".join(_run_card(run) for run in attention_runs) + "</div>"
+        if attention_runs
+        else ""
     )
+    shown_recent = recent_runs or ([] if attention_runs else runs)
+    recent = (
+        '<div class=section-head><div><p class=eyebrow>Projects</p><h2>Recent work</h2></div>'
+        f'<p>{len(runs)} active and visible</p></div><div class=project-grid>'
+        + "".join(_run_card(run) for run in shown_recent)
+        + "</div>"
+        if shown_recent
+        else ""
+    )
+    return (
+        '<section class=dashboard-shell><div class=dashboard-main>'
+        '<section class="card hero"><p class=eyebrow>Project dashboard</p><h1>Your 3D projects</h1>'
+        '<p class=lede>Continue a review, inspect completed evidence, or start from a new brief.</p>'
+        f'{toggle}</section>{attention}{recent}</div>'
+        '<aside class=dashboard-aside aria-label="Project actions">'
+        '<section class=card><h2>Create</h2><p class=muted>Start a project from a written brief and '
+        'choose the local tools that will produce it.</p><a class="button primary block" href=/new>'
+        'New asset</a></section>'
+        '<section class=card><h2>Workspace</h2><p><a href=/doctor>System readiness</a></p>'
+        '<p><a href=/golden>Developer golden corpus</a></p></section>'
+        '</aside></section>'
+    )
+
+
+def _active_runs_payload(store: StudioStore) -> list[dict[str, Any]]:
+    """Runs genuinely in flight or waiting on a human, for the header strip.
+
+    Deliberately narrower than the dashboard: "created" hasn't produced
+    anything yet, "blocked"/"failed"/"completed" are stopped states the
+    dashboard already surfaces. Archived runs are excluded for the same
+    reason the dashboard hides them by default -- the user said they were
+    done with it.
+    """
+    active = [
+        run
+        for run in store.list()
+        if not run.archived and run.state in {"running", "awaiting_review"}
+    ]
+    active.sort(key=lambda run: run.state != "awaiting_review")
+    return [
+        {
+            "run_id": run.run_id,
+            "title": run.title,
+            "state": run.state,
+            "current_stage": run.current_stage,
+        }
+        for run in active
+    ]
 
 
 def _available_profiles() -> list[str]:
@@ -1000,6 +1619,18 @@ def _available_profiles() -> list[str]:
         return ["simple"]
     names = sorted(p.stem for p in directory.glob("*.toml") if p.stem != "base")
     return names or ["simple"]
+
+
+def _service_unavailable_detail(remedy: str) -> str:
+    """A human status for the New-asset service widget's offline case.
+
+    _json_get's raw failure text is "<ExceptionType>: <message>", e.g.
+    "URLError: <urlopen error timed out>" or, on Windows, "URLError:
+    <urlopen error [WinError 10061] ... actively refused it>". That is
+    accurate and meaningless to someone who just typed a prompt -- it
+    names neither what is missing nor what to do. This names both.
+    """
+    return f"not running or not reachable -- {remedy}. See /doctor for the full check."
 
 
 def _setup_options(profile: str) -> dict[str, Any]:
@@ -1082,14 +1713,77 @@ def _setup_options(profile: str) -> dict[str, Any]:
         "services": {
             "comfyui": {
                 "ready": comfy_ready,
-                "detail": results["checkpoints"][1] if comfy_ready else results["diffusion_models"][1],
+                "detail": (
+                    results["checkpoints"][1]
+                    if comfy_ready
+                    else _service_unavailable_detail("start ComfyUI")
+                ),
             },
             "reviewer": {
                 "ready": reviewer_payload is not None,
-                "detail": results["reviewer"][1],
+                "detail": (
+                    results["reviewer"][1]
+                    if reviewer_payload is not None
+                    else _service_unavailable_detail("start Ollama or LocalDeploy")
+                ),
             },
         },
     }
+
+
+def _services_needed(
+    missing: list[dict[str, str]],
+    description: str,
+    profile: str,
+    csrf: str,
+    *,
+    intended_use: str = "",
+    must_have_features: str = "",
+) -> str:
+    """What to start, instead of a run that would fail on its first call.
+
+    Deliberately not phrased as an error: nothing went wrong, a required
+    local service simply is not running yet. The description is carried
+    back into the form so retrying costs one click, not retyping.
+    """
+    rows = "".join(
+        f'<li><strong>{html.escape(item["name"])}</strong> '
+        f'<span class="badge needs">not running</span><br>'
+        f'<span class=muted>{html.escape(item["url"])} did not answer.</span><br>'
+        f'<code>{html.escape(item["remedy"])}</code></li>'
+        for item in missing
+    )
+    plural = "service" if len(missing) == 1 else "services"
+    return (
+        '<section class="card hero"><h1>Start your local AI services first</h1>'
+        f"<p>Text2Model Forge needs {len(missing)} local {plural} that {'is' if len(missing) == 1 else 'are'} "
+        "not running yet. Nothing was created, so no failed run is left behind &mdash; "
+        "start the below, then press Try again.</p>"
+        f'<ul class="decisions">{rows}</ul>'
+        '<p class=muted>The launcher can install and start everything for you: '
+        '<code>.\\run.ps1 -AiStack qwen</code> on Windows, or '
+        '<code>./run.sh --ai-stack qwen</code> on Linux and macOS. '
+        'The <a href="/doctor">System page</a> shows every check in detail.</p>'
+        '<form method=post action=/runs>'
+        f'<input type=hidden name=csrf value="{csrf}">'
+        f'<input type=hidden name=description value="{html.escape(description, quote=True)}">'
+        f'<input type=hidden name=profile value="{html.escape(profile, quote=True)}">'
+        f'<input type=hidden name=intended_use value="{html.escape(intended_use, quote=True)}">'
+        f'<input type=hidden name=must_have_features value="{html.escape(must_have_features, quote=True)}">'
+        '<button class=primary type=submit>Try again</button>'
+        f'<a class=button href="/new?prompt={quote(description)}">Edit the description</a>'
+        "</form></section>"
+    )
+
+
+def _hint(text: str) -> str:
+    """A small "?" badge next to a label that reveals `text` on hover or
+    keyboard focus. Pure CSS (see .hint in STYLE), so it works without the
+    page's JS having loaded. Replaces the New-asset form's previous pattern
+    of a permanent <p class=muted> paragraph under every field -- accurate
+    but the reason the panel read as a wall of text before anyone touched a
+    control."""
+    return f'<span class=hint tabindex=0>?<span class=tip>{html.escape(text)}</span></span>'
 
 
 def _new_form(csrf: str, preset_description: str = "") -> str:
@@ -1116,59 +1810,82 @@ def _new_form(csrf: str, preset_description: str = "") -> str:
     candidates_default = html.escape(str(defaults.get("concept_candidates", 3)))
     device_default = html.escape(str(defaults.get("device_policy", "prefer_gpu")))
     return (
-        '<section class="card hero"><h1>Describe one original asset</h1>'
-        '<p>This is the only production input. It may be a character, creature, door, wall, prop, environment, material, or VFX. Include handedness, moving pieces, and required states when they matter; Qwen compiles the rest.</p>'
+        '<div class=crumb><a href=/>&larr; Projects</a></div><section class=create-shell>'
+        '<div class="card hero"><p class=eyebrow>New project</p>'
+        '<span class=visually-hidden>Describe one original asset</span><h1>What do you want to make?</h1>'
+        '<p class=lede>Describe the object and the result you need. Include moving parts, required states, dimensions, or handedness only when they matter.</p>'
         '<form method=post action=/runs data-setup-options>'
-        f'<input type=hidden name=csrf value="{csrf}">'
-        '<label>Description</label><textarea name=description minlength=20 required '
-        'placeholder="Examples: a weathered stone well with an iron crank; or a clockwork courier with a right-hand lantern and two walking states...">'
+        f'<input type=hidden name=csrf value="{html.escape(csrf, quote=True)}">'
+        '<label for=description>Asset brief</label><textarea id=description name=description minlength=20 maxlength=12000 required '
+        'placeholder="A weathered stone well with an iron crank, built as a static game prop...">'
         f'{html.escape(preset_description)}</textarea>'
-        f'<label>Configuration profile</label><select name=profile>{options}</select>'
-        '<details class=options open><summary>Text-to-2D and reviewer options</summary>'
-        '<p class=muted>Leave any field blank to inherit the selected profile. Installed model names appear as suggestions when the local services are running.</p>'
+        '<p class=field-hint>Use plain language. Studio compiles this into a typed production contract.</p>'
+        '<div class=form-grid><div><label for=intended-use>Intended use <span class=muted>(optional)</span></label>'
+        '<select id=intended-use name=intended_use><option value="">Not specified</option>'
+        '<option>Game-ready asset</option><option>Animation or cinematic</option>'
+        '<option>Visualization or prototype</option><option>Research or evaluation</option></select></div>'
+        '<div><label for=must-have>Must-have features <span class=muted>(optional)</span></label>'
+        '<input id=must-have name=must_have_features maxlength=1000 placeholder="For example: separate crank, clean silhouette"></div></div>'
+        # Collapsed for "simple" (the point of that profile is exactly not
+        # needing to see a checkpoint or device-policy field) and open for
+        # anything else, since "advanced" and "8gb" both depend on values in
+        # here. Still a plain <details>, so a simple-profile user who wants
+        # one override can always click it open themselves -- this only
+        # changes the default, not the access.
+        f'<details class=options{" open" if default != "simple" else ""}>'
+        '<summary>Generation and reviewer options</summary>'
+        f'<label for=profile>Configuration profile</label><select id=profile name=profile>{options}</select>'
+        f'<p class=muted>Leave any field blank to inherit the selected profile.{_hint("Installed model names appear as suggestions in the checkpoint and reviewer fields once local services are running.")}</p>'
         '<div class=option-grid>'
-        # Each option states the measured cost of choosing it. These numbers
-        # are wall-clock per candidate at 768x1024 on an 8 GB RTX 3080, taken
-        # from a real side-by-side run of one prompt through every backend --
-        # not vendor claims. D1 renders `concept_candidates` of these per
-        # iteration and re-runs the whole set on rejection, so the per-image
-        # figure is the one that decides whether a run finishes tonight.
-        '<div><label>Text-to-2D backend</label><select name=concept_backend>'
+        # Costs quoted in the option text and hints below are wall-clock per
+        # candidate at 768x1024 on an 8 GB RTX 3080, taken from a real
+        # side-by-side run of one prompt through every backend -- not vendor
+        # claims. D1 renders `concept_candidates` of these per iteration and
+        # re-runs the whole set on rejection, so the per-image figure is the
+        # one that decides whether a run finishes tonight.
+        f'<div><label for=concept-backend>Text-to-2D backend{_hint("Which model renders D1 concept images. Qwen and Z-Image ignore the checkpoint field below; SDXL uses it.")}</label>'
+        '<select id=concept-backend name=concept_backend>'
         f'<option value="">Profile default: {backend_default}</option>'
         '<option value=auto>Auto — Z-Image if installed, else Qwen, else SDXL</option>'
         '<option value=z_image_turbo>Z-Image Turbo — stylized, ~50 s/image (recommended)</option>'
         '<option value=qwen_image_2512>Qwen Image 2512 — best quality, ~10 min/image</option>'
         '<option value=sdxl>SDXL checkpoint — fastest, ~20 s/image</option>'
-        '</select>'
-        '<p class=muted data-backend-note>Times measured on this machine at 768&times;1024. '
-        'Qwen and Z-Image ignore the checkpoint field below; SDXL uses it.</p></div>'
-        '<div><label>SDXL / custom checkpoint</label>'
-        f'<input name=checkpoint list=installed-checkpoints maxlength=300 placeholder="Profile default: {checkpoint_default}">'
+        '</select></div>'
+        f'<div><label for=checkpoint>SDXL / custom checkpoint{_hint("Only read when the backend above is SDXL. Leave blank to use the profile default.")}</label>'
+        f'<input id=checkpoint name=checkpoint list=installed-checkpoints maxlength=300 placeholder="Profile default: {checkpoint_default}">'
         '<datalist id=installed-checkpoints></datalist></div>'
-        '<div><label>Qwen reviewer model</label>'
-        f'<input name=model list=installed-review-models maxlength=300 placeholder="Profile default: {model_default}">'
+        f'<div><label for=review-model>Qwen reviewer model{_hint("The vision model that compares D1 candidates and drives every later review gate. Leave blank to use the profile default.")}</label>'
+        f'<input id=review-model name=model list=installed-review-models maxlength=300 placeholder="Profile default: {model_default}">'
         '<datalist id=installed-review-models></datalist></div>'
-        '<div><label>D0 spec strategy</label><select name=spec_strategy>'
+        f'<div><label for=spec-strategy>D0 spec strategy{_hint("How your description becomes the typed asset contract. Chunked suits a 7-8B local reviewer; Monolithic expects the qualified 27B model.")}</label>'
+        '<select id=spec-strategy name=spec_strategy>'
         f'<option value="">Profile default: {strategy_default}</option>'
         '<option value=chunked>Chunked — best for 7–8B local models</option>'
         '<option value=monolithic>Monolithic — qualified 27B model</option>'
         '</select></div>'
-        '<div><label>Concept steps</label>'
-        f'<input name=concept_steps type=number min=1 max=150 placeholder="Profile default: {steps_default}"></div>'
-        '<div><label>Concept CFG</label>'
-        f'<input name=concept_cfg type=number min=0.1 max=30 step=0.1 placeholder="Profile default: {cfg_default}"></div>'
-        '<div><label>Sequential candidate budget</label>'
-        f'<input name=concept_candidates type=number min=2 max=12 placeholder="Profile default: {candidates_default}"></div>'
-        '<div><label>Device policy</label><select name=device_policy>'
+        f'<div><label for=concept-steps>Concept steps{_hint("Diffusion steps per D1 candidate. More steps cost more time for usually sharper detail.")}</label>'
+        f'<input id=concept-steps name=concept_steps type=number min=1 max=150 placeholder="Profile default: {steps_default}"></div>'
+        f'<div><label for=concept-cfg>Concept CFG{_hint("How closely the render follows the prompt. Higher is more literal and less varied; lower allows more creative drift.")}</label>'
+        f'<input id=concept-cfg name=concept_cfg type=number min=0.1 max=30 step=0.1 placeholder="Profile default: {cfg_default}"></div>'
+        f'<div><label for=concept-candidates>Sequential candidate budget{_hint("How many D1 concepts to generate one after another before the reviewer compares the best few. More candidates cost more time but improve the odds of a keeper.")}</label>'
+        f'<input id=concept-candidates name=concept_candidates type=number min=2 max=12 placeholder="Profile default: {candidates_default}"></div>'
+        f'<div><label for=device-policy>Device policy{_hint("Whether inference may fall back to CPU when the GPU will not fit it. Prefer GPU allows a silent, much slower fallback; GPU compute only fails fast instead. Check the System page for this machine's recommendation.")}</label>'
+        '<select id=device-policy name=device_policy>'
         f'<option value="">Profile default: {device_default}</option>'
         '<option value=gpu_compute_only>GPU compute only — requires live telemetry</option>'
         '<option value=prefer_gpu>Prefer GPU — CPU inference allowed</option>'
         '<option value=strict_device_only>Strict device only — experimental</option>'
         '</select></div>'
-        '</div><div id=setup-service-status class=service-status>Checking local AI services and installed models...</div>'
-        '</details><button class=primary type=submit>Compile asset and start</button></form>'
-        '<p class=muted>D1 is human-gated: reject, edit, or retry as many times as needed before the approved image is allowed into 3D.</p>'
-        '</section><script src="/static/studio.js" defer></script>'
+        '</div><div id=setup-service-status class=service-status role=status aria-live=polite>Checking local AI services and installed models...</div>'
+        '</details><div class=hero-actions><button class=primary type=submit>Start build</button>'
+        '<a class="button ghost" href=/>Cancel</a></div></form></div>'
+        '<aside class="card create-aside"><p class=eyebrow>What happens next</p><h2>A reviewable process</h2>'
+        '<ol><li>Studio turns the brief into a production contract.</li>'
+        '<li>You choose or reject the visual concept.</li><li>Each approved result becomes input to the next stage.</li>'
+        '<li>The final GLB and its provenance remain downloadable.</li></ol>'
+        '<p class=muted>Every human gate binds the decision to exact evidence hashes.</p>'
+        '<a href=/doctor>Check system readiness</a></aside></section>'
+        '<script src="/static/studio.js" defer></script>'
     )
 
 
@@ -1326,6 +2043,25 @@ def _preflight_html(hardware, checks, recommendation) -> str:
     )
 
 
+def _doctor_shell() -> str:
+    """What /doctor returns immediately, before any check has run.
+
+    The checks themselves are unchanged and still take as long as they take;
+    this only stops the browser from showing nothing at all while they do.
+    """
+    return (
+        '<section class="card hero" id=doctor-shell><p class=eyebrow>System</p>'
+        '<h1>Is this computer ready?</h1>'
+        '<p id=doctor-status class=checking role=status aria-live=polite>Checking hardware, local services, '
+        "and every cross-stage assumption&hellip;</p>"
+        '<div class="bar indeterminate"><span></span></div>'
+        "<p class=muted>Several checks wait on a local service that may not be running, "
+        "so this usually takes a few seconds. You can keep using the rest of Studio.</p>"
+        "</section>"
+        '<script src="/static/doctor.js" defer></script>'
+    )
+
+
 def _doctor() -> str:
     defaults = studio_overrides(resolve_settings(profile="simple"))
     reviewer_url = str(defaults.get("localdeploy_url", "http://127.0.0.1:8000/v1")).rstrip("/")
@@ -1354,20 +2090,63 @@ def _doctor() -> str:
         f'<span class=muted>{html.escape(str(item.get("executable") or item.get("health_error") or item.get("declared_lifecycle") or ""))}</span></li>'
         for item in workers
     )
+    failed_checks = [check for check in checks if check.status == "fail"]
+    issues: list[str] = []
+    if not localdeploy:
+        issues.append(
+            f'<article class=choice-card><h2>Start the reviewer</h2><p>{html.escape(localdeploy_detail)}</p>'
+            '<code>.\\run.ps1 -AiStack qwen</code></article>'
+        )
+    if not comfy:
+        issues.append(
+            f'<article class=choice-card><h2>Start image generation</h2><p>{html.escape(comfy_detail)}</p>'
+            '<code>.\\run.ps1 -AiStack qwen</code></article>'
+        )
+    if not config:
+        issues.append(
+            '<article class=choice-card><h2>Create local configuration</h2>'
+            '<p>Copy <code>machine.example.toml</code> to <code>config.local.toml</code> and set local paths.</p>'
+            '</article>'
+        )
+    if failed_checks:
+        issues.append(
+            f'<article class=choice-card><h2>Resolve production assumptions</h2><p>'
+            f'{len(failed_checks)} cross-stage check{"s" if len(failed_checks) != 1 else ""} failed. '
+            'Open the technical report below for the exact remedies.</p></article>'
+        )
+    ready_for_build = not issues and ready == len(workers)
+    status_title = "Ready to create" if ready_for_build else "Setup needs attention"
+    status_copy = (
+        "The required local services and deterministic workers are available."
+        if ready_for_build
+        else "Resolve the items below before starting a production project. The offline tutorial remains available."
+    )
+    issue_grid = (
+        f'<div class=choice-grid>{"".join(issues)}</div>'
+        if issues
+        else '<div class="notice success">No blocking setup issue was detected.</div>'
+    )
     return (
-        '<section class="card hero"><h1>Local production system</h1><div class=health>'
+        '<section class="card hero"><p class=eyebrow>System readiness</p>'
+        f'<h1>{html.escape(status_title)}</h1><p class=lede>{html.escape(status_copy)}</p>'
+        '<div class=health>'
         f'<span class="{"" if localdeploy else "down"}">Qwen reviewer ({html.escape(reviewer_url)}): {html.escape(localdeploy_detail)}</span>'
         f'<span class="{"" if comfy else "down"}">ComfyUI ({html.escape(comfy_url)}): {html.escape(comfy_detail)}</span>'
         f'<span class="{"" if config else "down"}">Text2Model Forge config: {"loaded" if config else "missing (copy machine.example.toml to config.local.toml)"}</span>'
         f'<span class="{"" if ready else "down"}">Workers ready: {ready}/{len(workers)}</span>'
         f'<span class="{"" if hardware.detected else "down"}">GPU: '
         f'{html.escape((hardware.primary.name if hardware.primary else "not detected"))}'
-        f'{f" &mdash; {hardware.vram_total_gb} GB" if hardware.vram_total_gb else ""}</span>'
-        '</div>'
+        f'{f" · {hardware.vram_total_gb} GB" if hardware.vram_total_gb else ""}</span></div>'
+        f'<div class=hero-actions><a class="button primary" href=/new>Create an asset</a>'
+        '<a class="button secondary" href=/>Open projects</a></div></section>'
+        f'<section><div class=section-head><div><p class=eyebrow>Next actions</p>'
+        f'<h2>{"Nothing to fix" if not issues else "What to fix"}</h2></div></div>{issue_grid}</section>'
+        '<details class="card advanced-drawer"><summary>Technical readiness report</summary>'
         + _preflight_html(hardware, checks, recommendation)
-        + '<h2 style="margin-top:18px">Deterministic worker preflight</h2>'
+        + '<h2>Deterministic worker preflight</h2>'
         f'<ul class="decisions">{rows or "<li>No worker manifests were found.</li>"}</ul>'
-        '<p class=muted>Studio binds to loopback by default. The Docker profile uses an explicit container-only bind and publishes it on host loopback. Qwen proposes structured decisions; it never executes code or edits artifacts.</p></section>'
+        '<p class=muted>Studio binds to loopback by default. Qwen proposes structured decisions; '
+        'it never executes code or edits artifacts.</p></details>'
     )
 
 
@@ -1457,6 +2236,7 @@ def build_server(
     store = StudioStore(workspace)
     recovered = store.recover_interrupted_runs()
     coordinator = (coordinator_factory or StudioCoordinator)(store)
+    application = StudioApplication(store, coordinator)
     csrf = secrets.token_urlsafe(32)
 
     class Handler(BaseHTTPRequestHandler):
@@ -1490,16 +2270,20 @@ def build_server(
                 path = parsed.path
                 if path == "/":
                     show_archived = parse_qs(parsed.query).get("archived", [""])[0] == "1"
-                    self.page("Text2Model Forge Studio", _dashboard(store, show_archived=show_archived))
+                    self.page(
+                        "Text2Model Forge Studio",
+                        _dashboard(store, csrf, show_archived=show_archived),
+                    )
                 elif path == "/new":
                     preset = parse_qs(parsed.query).get("prompt", [""])[0]
                     self.page("New asset", _new_form(csrf, preset))
                 elif path == "/golden":
                     self.page("Golden corpus", _golden_dashboard(store))
                 elif path == "/doctor":
-                    self.page("System", _doctor())
+                    self.page("System", _doctor_shell())
                 elif path == "/favicon.ico":
-                    self._headers(HTTPStatus.NO_CONTENT, "image/x-icon", 0)
+                    self._headers(HTTPStatus.OK, "image/svg+xml", len(_FAVICON))
+                    self.wfile.write(_FAVICON)
                 elif path.startswith("/run/"):
                     parts = path.split("/")
                     if len(parts) >= 5 and parts[3] == "stage":
@@ -1517,11 +2301,56 @@ def build_server(
                     payload = GLB_VIEWER_JS.encode("utf-8")
                     self._headers(HTTPStatus.OK, "text/javascript; charset=utf-8", len(payload))
                     self.wfile.write(payload)
-                elif path == "/api/setup/options":
+                elif path == "/static/active-runs.js":
+                    payload = ACTIVE_RUNS_JS.encode("utf-8")
+                    self._headers(HTTPStatus.OK, "text/javascript; charset=utf-8", len(payload))
+                    self.wfile.write(payload)
+                elif path == "/static/doctor.js":
+                    payload = DOCTOR_JS.encode("utf-8")
+                    self._headers(HTTPStatus.OK, "text/javascript; charset=utf-8", len(payload))
+                    self.wfile.write(payload)
+                elif path == "/api/doctor":
+                    payload = _doctor().encode("utf-8")
+                    self._headers(HTTPStatus.OK, "text/html; charset=utf-8", len(payload))
+                    self.wfile.write(payload)
+                elif path in {"/api/setup/options", "/api/v1/system/setup-options"}:
                     profile = parse_qs(parsed.query).get("profile", ["simple"])[0]
                     if profile not in _available_profiles():
                         raise ValueError(f"unknown configuration profile: {profile}")
                     payload = json.dumps(_setup_options(profile)).encode("utf-8")
+                    self._headers(HTTPStatus.OK, "application/json; charset=utf-8", len(payload))
+                    self.wfile.write(payload)
+                elif path == "/api/active-runs":
+                    payload = json.dumps(_active_runs_payload(store)).encode("utf-8")
+                    self._headers(HTTPStatus.OK, "application/json; charset=utf-8", len(payload))
+                    self.wfile.write(payload)
+                elif path == "/api/v1/projects":
+                    payload = json.dumps(
+                        [
+                            {
+                                "run_id": run.run_id,
+                                "title": run.title,
+                                "state": run.state,
+                                "run_mode": run.run_mode,
+                                "current_stage": run.current_stage,
+                                "progress": _run_progress(run),
+                                "updated_at": run.updated_at.isoformat(),
+                            }
+                            for run in application.list_projects(include_archived=True)
+                        ],
+                        indent=2,
+                    ).encode("utf-8")
+                    self._headers(HTTPStatus.OK, "application/json; charset=utf-8", len(payload))
+                    self.wfile.write(payload)
+                elif path.startswith("/api/v1/projects/"):
+                    remainder = path.removeprefix("/api/v1/projects/")
+                    if remainder.endswith("/events"):
+                        run_id = unquote(remainder[: -len("/events")].rstrip("/"))
+                        application.get_project(run_id)
+                        payload = json.dumps(store.read_events(run_id), indent=2).encode("utf-8")
+                    else:
+                        run_id = unquote(remainder.rstrip("/"))
+                        payload = application.get_project(run_id).model_dump_json(indent=2).encode("utf-8")
                     self._headers(HTTPStatus.OK, "application/json; charset=utf-8", len(payload))
                     self.wfile.write(payload)
                 elif path.startswith("/api/run/"):
@@ -1548,13 +2377,50 @@ def build_server(
         def do_POST(self) -> None:
             try:
                 path = urlparse(self.path).path
+                # A file upload cannot go through _form(): that parser reads
+                # the whole body as one urlencoded blob and would consume it
+                # from the socket before this branch got a chance to. Every
+                # other route's body is small and urlencoded, so this is the
+                # only path that needs to read the request itself.
+                if path.startswith("/run/") and path.endswith("/upload-image"):
+                    run_id = unquote(path.split("/")[2])
+                    fields = _multipart_form(self, max_bytes=21 * 1024 * 1024)
+                    if not secrets.compare_digest(str(fields.get("csrf", "")), csrf):
+                        raise ValueError("invalid form token")
+                    upload = fields.get("image")
+                    if not isinstance(upload, tuple) or not upload[0]:
+                        raise ValueError("choose an image file to upload")
+                    filename, data = upload
+                    if not coordinator.submit_manual_image_upload(run_id, data, filename):
+                        raise ValueError("another Studio job is already running for this asset")
+                    self.redirect("/run/" + quote(run_id))
+                    return
                 values = _form(self)
                 if not secrets.compare_digest(values.get("csrf", ""), csrf):
                     raise ValueError("invalid form token")
-                if path == "/runs":
+                if path == "/demo":
+                    run_id = "tutorial-" + _slug().removeprefix("asset-")
+                    application.create_tutorial(run_id)
+                    self.redirect("/run/" + quote(run_id))
+                elif path == "/runs":
                     description = values.get("description", "").strip()
                     if len(description) < 20:
                         raise ValueError("description must contain at least 20 characters")
+                    if len(description) > 12000:
+                        raise ValueError("description must contain no more than 12000 characters")
+                    intended_use = values.get("intended_use", "").strip()
+                    allowed_uses = {
+                        "",
+                        "Game-ready asset",
+                        "Animation or cinematic",
+                        "Visualization or prototype",
+                        "Research or evaluation",
+                    }
+                    if intended_use not in allowed_uses:
+                        raise ValueError("unknown intended use")
+                    must_have = values.get("must_have_features", "").strip()
+                    if len(must_have) > 1000:
+                        raise ValueError("must-have features must contain no more than 1000 characters")
                     profile = values.get("profile", "simple").strip() or "simple"
                     # resolve_settings() turns this straight into a
                     # profiles/<name>.toml path, so accept only a profile the
@@ -1562,13 +2428,35 @@ def build_server(
                     # post happens to carry.
                     if profile not in _available_profiles():
                         raise ValueError(f"unknown configuration profile: {profile}")
+                    overrides = {
+                        **_new_run_overrides(values, profile),
+                        "profile": profile,
+                        "intended_use": intended_use or None,
+                        "must_have_features": must_have or None,
+                    }
+                    # Refuse before creating anything. A run started without
+                    # its reviewer dies on D0's first call and leaves a
+                    # permanently failed run behind that never produced a
+                    # single piece of evidence -- the failure the user hits
+                    # is not the pipeline's, it is a setup step nobody was
+                    # told about. Say so here, keep their description, and
+                    # create nothing.
+                    missing = coordinator.missing_services(overrides)
+                    if missing:
+                        self.page(
+                            "Start your local AI services",
+                            _services_needed(
+                                missing,
+                                description,
+                                profile,
+                                csrf,
+                                intended_use=intended_use,
+                                must_have_features=must_have,
+                            ),
+                        )
+                        return
                     run_id = _slug()
-                    store.create(
-                        run_id,
-                        description,
-                        {**_new_run_overrides(values, profile), "profile": profile},
-                    )
-                    coordinator.submit(run_id)
+                    application.create_project(run_id, description, overrides)
                     self.redirect("/run/" + quote(run_id))
                 elif path.startswith("/run/") and path.endswith("/decision"):
                     run_id = unquote(path.split("/")[2])
@@ -1585,7 +2473,7 @@ def build_server(
                             raise ValueError(
                                 'Overrides must be a JSON object, for example {"seed": 42}.'
                             )
-                    store.decide(
+                    application.decide(
                         run_id,
                         values["stage_id"],
                         values["decision"],
@@ -1595,7 +2483,6 @@ def build_server(
                         target_stage_id=values.get("target_stage_id") or None,
                         assisted_by_review_id=values.get("assisted_by_review_id") or None,
                     )
-                    coordinator.submit(run_id)
                     self.redirect("/run/" + quote(run_id))
                 elif path.startswith("/run/") and path.endswith("/qwen-image"):
                     run_id = unquote(path.split("/")[2])
@@ -1622,18 +2509,26 @@ def build_server(
                     self.redirect("/run/" + quote(run_id))
                 elif path.startswith("/run/") and path.endswith("/resume"):
                     run_id = unquote(path.split("/")[2])
-                    coordinator.submit(run_id)
+                    application.resume(run_id)
                     self.redirect("/run/" + quote(run_id))
                 elif path.startswith("/run/") and path.endswith("/archive"):
                     run_id = unquote(path.split("/")[2])
-                    store.set_archived(run_id, True)
+                    application.set_archived(run_id, True)
                     self.redirect("/")
                 elif path.startswith("/run/") and path.endswith("/unarchive"):
                     run_id = unquote(path.split("/")[2])
-                    store.set_archived(run_id, False)
+                    application.set_archived(run_id, False)
                     self.redirect("/run/" + quote(run_id))
                 else:
                     self.page("Not found", "<h1>Not found</h1>", HTTPStatus.NOT_FOUND)
+            except StudioConflictError as exc:
+                self.page(
+                    "Project changed",
+                    '<section class=card><h1>Reload before applying that decision</h1>'
+                    f'<p>{html.escape(str(exc))}</p><a class="button primary" href="{html.escape(self.path, quote=True)}">'
+                    'Reload project</a></section>',
+                    HTTPStatus.CONFLICT,
+                )
             except (KeyError, FileNotFoundError, ValueError) as exc:
                 self.page(
                     "Text2Model Forge Studio error",

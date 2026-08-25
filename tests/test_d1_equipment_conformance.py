@@ -183,6 +183,11 @@ def test_a_duplicated_candidate_is_never_offered_as_approvable(tmp_path: Path) -
     assert all(item.metrics["selectable"] is False for item in candidates)
 
     # and the store refuses the approval even if the gate were somehow offered
+    # Reload after the background worker has stopped. The earlier snapshot was
+    # intentionally captured while D1 was still retrying and is stale under
+    # StudioStore's optimistic concurrency contract.
+    run = store.load("shield-dup-blocked-v1")
+    candidates = _candidate_evidence(run)
     stage = run.stage("D1")
     stage.state = "awaiting_review"
     store.save(run)

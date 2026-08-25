@@ -3,13 +3,16 @@ from __future__ import annotations
 
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timezone
+import io
 import json
 from pathlib import Path
 import secrets
 import subprocess
 import sys
 import threading
+import time
 from typing import Any, Protocol
+import urllib.error
 import urllib.request
 from text2model_forge.paths import resource_root
 
@@ -19,7 +22,13 @@ from .config import load_local_config, worker_binding
 from .concept_quality import assess_concept_image
 from .duplicate_detection import patch_already_present_elsewhere
 from .external_worker import SubprocessWorkerAdapter
-from .gpu import GpuLease, admit_gpu_memory, gpu_memory_snapshot, wait_for_free_vram
+from .gpu import (
+    GpuLease,
+    GpuMemoryAdmissionError,
+    admit_gpu_memory,
+    gpu_memory_snapshot,
+    wait_for_free_vram,
+)
 from .hardware import reviewer_vram_requirement
 from .hashing import sha256_file
 from .manifests import load_manifests
@@ -443,12 +452,134 @@ class _VramHandoff:
         )
         urllib.request.urlopen(request, timeout=20).close()
 
+    @staticmethod
+    def _admission_advice(original: str, required_gb: float, margin_gb: float) -> str:
+        """Turn a bare admission refusal into something the operator can act on.
+
+        "GPU memory did not recover within 60s; last free VRAM was 0.601 GiB"
+        is true and unusable: it names neither how much was needed nor what
+        is holding the card. On a laptop GPU the answer is usually the
+        desktop itself -- a browser, an editor, and a vendor overlay can
+        hold 2-3 GB of an 8 GB card before any model loads, which is enough
+        to make every image backend permanently unadmittable.
+        """
+        needed = required_gb + margin_gb
+        detail = [original, f"This step needs {needed:.2f} GB free ({required_gb:.2f} GB + {margin_gb:.2f} GB margin)."]
+        snapshot = None
+        try:
+            snapshot = gpu_memory_snapshot()
+        except Exception:
+            snapshot = None
+        device = (snapshot or {}).get("device") or {}
+        if device:
+            total = float(device.get("total_gb") or 0)
+            free = float(device.get("free_gb") or 0)
+            if total:
+                held = total - free
+                detail.append(
+                    f"The card has {total:.2f} GB total and {free:.2f} GB free right now, "
+                    f"so {held:.2f} GB is held by other processes."
+                )
+                if needed > total:
+                    detail.append(
+                        "That is more than the card's entire capacity, so this backend cannot run "
+                        "on this GPU at any desktop load. Choose a smaller concept backend."
+                    )
+                elif held > 0.5:
+                    detail.append(
+                        "Close GPU-using applications (a browser, an editor, or a vendor overlay are "
+                        "the usual holders) and resume, or choose a smaller concept backend. "
+                        "The System page lists what this machine can actually reach."
+                    )
+        return " ".join(detail)
+
+    @staticmethod
+    def _endpoint(run: StudioRun, service: str) -> tuple[str, str, str]:
+        """(display name, health URL, remedy) for the service a call will use."""
+        if service == "comfy":
+            base = run.comfy_url.rstrip("/")
+            return (
+                "ComfyUI",
+                f"{base}/system_stats",
+                "Start ComfyUI: python main.py --listen 127.0.0.1 --port 8188 "
+                "--normalvram --reserve-vram 0.75 --preview-method none",
+            )
+        base = run.localdeploy_url.rstrip("/")
+        return ("The reviewer model", f"{base}/models", "Start Ollama: ollama serve")
+
+    @staticmethod
+    def _reachable(url: str, timeout: float = 2.0) -> bool:
+        try:
+            with urllib.request.urlopen(url, timeout=timeout) as response:
+                return response.status == 200
+        except Exception:
+            return False
+
+    @staticmethod
+    def _service_is_absent(exc: BaseException) -> bool:
+        """True only when the unload call failed because nothing is listening.
+
+        This is not a relaxation of the fail-closed admission contract, and
+        the distinction is the whole point. The handoff exists to guarantee
+        one postcondition -- the *other* service is not holding VRAM when
+        this one loads. A service that refused the TCP connection is not
+        running, therefore holds no VRAM, therefore already satisfies that
+        postcondition. Failing the stage there reports a memory-safety
+        violation that provably cannot exist, which is what turned "ComfyUI
+        is not installed yet" into a D0 stage failure carrying a raw
+        WinError 10061.
+
+        Two cases are deliberately excluded and still fail closed:
+
+        - an HTTPError means the service answered and *refused* to unload,
+          which is a real admission failure;
+        - a timeout means the service is listening but not responding, and
+          a hung service may well still be resident and holding memory --
+          exactly the condition this handoff protects against.
+
+        The live-telemetry admission checks below (wait_for_free_vram and
+        admit_gpu_memory) are untouched and still gate on measured free
+        memory, so a machine that really is short on VRAM still fails here.
+        """
+        if isinstance(exc, urllib.error.HTTPError):
+            return False
+        reason = getattr(exc, "reason", exc)
+        return isinstance(reason, ConnectionError)
+
     class _Proxy:
         def __init__(self, inner: Any, run: StudioRun, lease_root: Path, service: str) -> None:
             self._inner = inner
             self._run = run
             self._lease_root = lease_root
             self._service = service
+
+        def _resident_gb(self) -> float:
+            """How much VRAM the service this call targets already holds.
+
+            Only measurable for the reviewer, whose server reports per-model
+            residency. ComfyUI exposes no equivalent per-model figure, so its
+            side returns 0 and keeps demanding the full envelope -- the
+            conservative direction, and harmless because the handoff unloads
+            ComfyUI before a reviewer call anyway.
+            """
+            if self._service != "qwen":
+                return 0.0
+            root = self._run.localdeploy_url.rstrip("/")
+            if root.endswith("/v1"):
+                root = root[: -len("/v1")]
+            try:
+                with urllib.request.urlopen(root + "/api/ps", timeout=4) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+            except Exception:
+                return 0.0
+            resident = 0.0
+            for item in (payload or {}).get("models") or []:
+                if str(item.get("name")) != self._run.model:
+                    continue
+                size = item.get("size_vram")
+                if isinstance(size, (int, float)):
+                    resident += float(size) / (1024**3)
+            return resident
 
         def __getattr__(self, name: str) -> Any:
             attribute = getattr(self._inner, name)
@@ -470,11 +601,38 @@ class _VramHandoff:
                             "GPU-compute-only policy rejected a ComfyUI workflow with explicit CPU "
                             f"inference nodes: {cpu_nodes}"
                         )
+                    # The same policy, applied to the server rather than the
+                    # graph. A ComfyUI started with --lowvram/--novram/--cpu
+                    # offloads weights to system RAM: nothing fails, it just
+                    # streams over PCIe, which is the silent CPU fallback
+                    # this policy forbids. Checked here so it can never be
+                    # reintroduced by however ComfyUI happens to be launched.
+                    offload = _VramHandoff._comfy_offload_flags(self._run.comfy_url)
+                    if offload:
+                        raise RuntimeError(
+                            f"GPU-compute-only policy rejected ComfyUI: it is running with "
+                            f"{' '.join(offload)}, which streams model weights from system RAM "
+                            "instead of keeping them on the GPU. Restart it without those flags "
+                            "(--reserve-vram is fine), or set [studio_defaults].device_policy = "
+                            '"prefer_gpu" to accept the slowdown deliberately.'
+                        )
                 required = (
                     reviewer_vram_requirement(self._run.model) or 4.0
                     if self._service == "qwen"
                     else _VramHandoff._comfy_required(self._run, workflow)
                 )
+                # Confirm the service exists before spending up to a minute
+                # waiting for GPU memory on its behalf. An absent ComfyUI
+                # used to surface as "GPU memory did not recover within 60s",
+                # which names the wrong problem entirely and hides the one
+                # thing the operator can act on. A refused loopback
+                # connection costs microseconds, so this is free when the
+                # service is up.
+                name_, health_url, remedy = _VramHandoff._endpoint(self._run, self._service)
+                if not _VramHandoff._reachable(health_url):
+                    raise RuntimeError(
+                        f"{name_} is not reachable at {health_url}, so this stage cannot run. {remedy}"
+                    )
                 lease = GpuLease(
                     self._lease_root,
                     run_id=self._run.run_id,
@@ -485,45 +643,213 @@ class _VramHandoff:
                     if self._run.vram_handoff:
                         try:
                             if self._service == "qwen":
-                                _VramHandoff._free_comfy(self._run.comfy_url)
+                                # Evict ComfyUI only when the reviewer will
+                                # not otherwise fit. Unconditional eviction
+                                # made D1 pathological: ComfyUI re-staged
+                                # ~5.9 GB from disk before every subsequent
+                                # render, measured at 8m52s of model
+                                # initialization for 30s of actual sampling,
+                                # on a stage that renders six candidates and
+                                # alternates with the reviewer between each.
+                                snapshot = gpu_memory_snapshot() or {}
+                                free_now = float(
+                                    (snapshot.get("device") or {}).get("free_gb") or 0
+                                )
+                                needed = required + self._run.gpu_safety_margin_gb
+                                if free_now < needed:
+                                    _VramHandoff._free_comfy(self._run.comfy_url)
                             else:
                                 _VramHandoff._free_llm(self._run.localdeploy_url, self._run.model)
-                        except Exception:
-                            if self._run.device_policy != "prefer_gpu":
+                        except Exception as exc:
+                            if (
+                                self._run.device_policy != "prefer_gpu"
+                                and not _VramHandoff._service_is_absent(exc)
+                            ):
                                 raise
-                        if self._run.device_policy != "prefer_gpu":
-                            wait_for_free_vram(
-                                required,
-                                safety_margin_gb=self._run.gpu_safety_margin_gb,
-                                timeout_seconds=self._run.gpu_unload_timeout_seconds,
+                    # Memory this service ALREADY holds is its own allocation,
+                    # not competition for it. Without this the reviewer waits
+                    # for room to load a model that is already loaded: with
+                    # qwen3-vl:4b resident at 3.94 GB and 0.42 GB free, the
+                    # gate demanded 4.35 GB free *for that same model* and
+                    # timed out every time. Deducting what is already resident
+                    # is not a weakening -- an unloaded model still has to
+                    # prove its full envelope fits.
+                    outstanding = max(0.0, required - self._resident_gb())
+                    # ComfyUI's own --reserve-vram already holds back driver
+                    # headroom. Studio's safety margin serves the same
+                    # purpose, so demanding both reserved it twice and
+                    # refused renders that fit with room to spare.
+                    margin = self._run.gpu_safety_margin_gb
+                    self_reported: float | None = None
+                    if self._service == "comfy":
+                        margin = max(
+                            0.0, margin - _VramHandoff._comfy_reserved_gb(self._run.comfy_url)
+                        )
+                        self_reported = _VramHandoff._comfy_free_gb(self._run.comfy_url)
+                    if self_reported is not None:
+                        # ComfyUI is the process that will allocate, and it
+                        # counts its own reusable pools. Take its answer
+                        # rather than the driver's, which cannot see them.
+                        if self_reported < outstanding + margin:
+                            raise GpuMemoryAdmissionError(
+                                _VramHandoff._admission_advice(
+                                    f"ComfyUI reports only {self_reported:.2f} GiB allocatable",
+                                    outstanding,
+                                    margin,
+                                )
                             )
-                    admit_gpu_memory(
-                        required,
-                        safety_margin_gb=self._run.gpu_safety_margin_gb,
-                        require_measurement=self._run.device_policy != "prefer_gpu",
-                    )
+                        return attribute(*args, **kwargs)
+                    if self._run.vram_handoff and self._run.device_policy != "prefer_gpu":
+                        if outstanding > 0:
+                            try:
+                                wait_for_free_vram(
+                                    outstanding,
+                                    safety_margin_gb=margin,
+                                    timeout_seconds=self._run.gpu_unload_timeout_seconds,
+                                )
+                            except GpuMemoryAdmissionError as exc:
+                                raise GpuMemoryAdmissionError(
+                                    _VramHandoff._admission_advice(
+                                        str(exc), outstanding, margin
+                                    )
+                                ) from exc
+                    # Nothing to admit when the service already holds its
+                    # whole envelope: there is no new allocation to prove
+                    # fits. Demanding the driver-headroom margin anyway
+                    # refused a resident reviewer over 0.02 GB -- the same
+                    # model that had just completed D0 on that exact card.
+                    # The margin protects a *load*; this call performs none.
+                    if outstanding > 0:
+                        try:
+                            admit_gpu_memory(
+                                outstanding,
+                                safety_margin_gb=margin,
+                                require_measurement=self._run.device_policy != "prefer_gpu",
+                            )
+                        except GpuMemoryAdmissionError as exc:
+                            raise GpuMemoryAdmissionError(
+                                _VramHandoff._admission_advice(
+                                    str(exc), outstanding, margin
+                                )
+                            ) from exc
                     return attribute(*args, **kwargs)
                 finally:
                     lease.release()
 
             return wrapped
 
+    # How much of a model ComfyUI actually keeps resident, by the memory
+    # mode it was launched with. The envelopes above describe the default
+    # mode, where the whole model is loaded to the device. --lowvram and
+    # --novram stream weights block by block, so peak residency is a
+    # fraction of the file: refusing a job on the full-load figure while
+    # ComfyUI is streaming rejects work the GPU can comfortably do.
+    # Measured from ComfyUI's own reported argv rather than assumed, so a
+    # relaunch in a different mode is picked up without touching config.
+    _COMFY_MODE_FRACTION = {"--novram": 0.25, "--lowvram": 0.45, "--highvram": 1.0, "--gpu-only": 1.0}
+
+    @staticmethod
+    def _comfy_mode_fraction(comfy_url: str) -> float:
+        try:
+            with urllib.request.urlopen(
+                comfy_url.rstrip("/") + "/system_stats", timeout=4
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return 1.0
+        argv = [str(item) for item in (payload.get("system") or {}).get("argv") or []]
+        for flag, fraction in _VramHandoff._COMFY_MODE_FRACTION.items():
+            if flag in argv:
+                return fraction
+        return 1.0
+
+    # ComfyUI launch flags that move weights off the GPU. Under a
+    # GPU-only device policy these are exactly the "silent CPU inference"
+    # the policy exists to forbid: the run still completes, so nothing
+    # fails, it just streams weights across PCIe and takes forever --
+    # measured here at 8m52s of model initialization for 30s of sampling,
+    # against 45s for the same render with the model resident.
+    _COMFY_CPU_OFFLOAD_FLAGS = ("--cpu", "--novram", "--lowvram")
+
+    @staticmethod
+    def _comfy_offload_flags(comfy_url: str) -> list[str]:
+        try:
+            with urllib.request.urlopen(
+                comfy_url.rstrip("/") + "/system_stats", timeout=4
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return []
+        argv = [str(item) for item in (payload.get("system") or {}).get("argv") or []]
+        return [flag for flag in _VramHandoff._COMFY_CPU_OFFLOAD_FLAGS if flag in argv]
+
+    @staticmethod
+    def _comfy_free_gb(comfy_url: str) -> float | None:
+        """ComfyUI's own view of the VRAM it can allocate, or None.
+
+        For a ComfyUI render this is the authoritative number and the
+        driver's is not: after a render ComfyUI keeps a CUDA context and
+        allocator pools that nvidia-smi still counts as used, but which
+        ComfyUI reuses for the next render without asking the driver for
+        anything. Gating that render on driver-free memory demands the same
+        capacity twice and refuses a second render that the first one
+        proved fits -- observed here as a failure on concept 2 of 6 with
+        the reviewer already unloaded and nothing else on the card.
+        """
+        try:
+            with urllib.request.urlopen(
+                comfy_url.rstrip("/") + "/system_stats", timeout=4
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return None
+        for device in payload.get("devices") or []:
+            free = device.get("vram_free")
+            if isinstance(free, (int, float)):
+                return float(free) / (1024**3)
+        return None
+
+    @staticmethod
+    def _comfy_reserved_gb(comfy_url: str) -> float:
+        """ComfyUI's own --reserve-vram, which is driver headroom it already
+        holds back. Studio's safety margin exists for the same purpose, so
+        counting both makes the requirement 1.5 GB of headroom on an 8 GB
+        card and refuses jobs that fit."""
+        try:
+            with urllib.request.urlopen(
+                comfy_url.rstrip("/") + "/system_stats", timeout=4
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except Exception:
+            return 0.0
+        argv = [str(item) for item in (payload.get("system") or {}).get("argv") or []]
+        if "--reserve-vram" in argv:
+            index = argv.index("--reserve-vram")
+            if index + 1 < len(argv):
+                try:
+                    return float(argv[index + 1])
+                except ValueError:
+                    return 0.0
+        return 0.0
+
     @staticmethod
     def _comfy_required(run: StudioRun, workflow: Any) -> float:
+        base = _VramHandoff._COMFY_REQUIRED_GB.get(run.concept_backend, 6.0)
         if isinstance(workflow, dict):
             if any(node.get("class_type") == "Hunyuan3Dv2Conditioning" for node in workflow.values()):
-                return _VramHandoff._COMFY_REQUIRED_GB["hunyuan3d"]
-            names = " ".join(
-                str(value)
-                for node in workflow.values()
-                for value in (node.get("inputs") or {}).values()
-                if isinstance(value, str)
-            ).lower()
-            if "z_image" in names:
-                return _VramHandoff._COMFY_REQUIRED_GB["z_image_turbo"]
-            if "qwen_image" in names:
-                return _VramHandoff._COMFY_REQUIRED_GB["qwen_image_2512"]
-        return _VramHandoff._COMFY_REQUIRED_GB.get(run.concept_backend, 6.0)
+                base = _VramHandoff._COMFY_REQUIRED_GB["hunyuan3d"]
+            else:
+                names = " ".join(
+                    str(value)
+                    for node in workflow.values()
+                    for value in (node.get("inputs") or {}).values()
+                    if isinstance(value, str)
+                ).lower()
+                if "z_image" in names:
+                    base = _VramHandoff._COMFY_REQUIRED_GB["z_image_turbo"]
+                elif "qwen_image" in names:
+                    base = _VramHandoff._COMFY_REQUIRED_GB["qwen_image_2512"]
+        return base * _VramHandoff._comfy_mode_fraction(run.comfy_url)
 
     @classmethod
     def wrap_qwen(cls, inner: Any, run: StudioRun, lease_root: Path) -> Any:
@@ -550,6 +876,12 @@ class StudioCoordinator:
         self.store = store
         real_qwen = qwen_factory is None
         real_comfy = comfy_factory is None
+        # Whether this coordinator drives real local services or injected
+        # fakes. missing_services() needs to know: probing loopback is the
+        # right precondition for a real run and meaningless for a test that
+        # supplies its own providers.
+        self._real_qwen = real_qwen
+        self._real_comfy = real_comfy
         self._qwen_factory = qwen_factory or (
             lambda run: StudioQwen(
                 base_url=run.localdeploy_url,
@@ -614,6 +946,62 @@ class StudioCoordinator:
             self._jobs[run_id] = self._executor.submit(self._drive, run_id)
             return True
 
+    def missing_services(self, settings: dict[str, Any]) -> list[dict[str, str]]:
+        """Local services a real run needs that are not answering right now.
+
+        Checked *before* a run is created rather than discovered at D0,
+        because a run started without its reviewer cannot reach any gate:
+        it fails on its first call and leaves behind a permanently failed
+        run that never produced evidence. Returning the remedy alongside
+        the name keeps the caller from having to know how each service is
+        started.
+
+        Returns an empty list when providers were injected -- a test or an
+        embedding caller supplies its own, so loopback readiness says
+        nothing about whether that run can proceed.
+        """
+        wanted: list[tuple[str, str, str, str]] = []
+        if self._real_qwen:
+            reviewer = str(settings.get("localdeploy_url", "")).rstrip("/")
+            if reviewer:
+                wanted.append(
+                    (
+                        "Reviewer model",
+                        reviewer,
+                        f"{reviewer}/models",
+                        "Start Ollama (it serves the reviewer): ollama serve",
+                    )
+                )
+        if self._real_comfy:
+            comfy = str(settings.get("comfy_url", "")).rstrip("/")
+            if comfy:
+                wanted.append(
+                    (
+                        "ComfyUI",
+                        comfy,
+                        f"{comfy}/system_stats",
+                        "Start ComfyUI: python main.py --listen 127.0.0.1 --port 8188 "
+                        "--normalvram --reserve-vram 0.75 --preview-method none",
+                    )
+                )
+        if not wanted:
+            return []
+
+        def reachable(url: str) -> bool:
+            try:
+                with urllib.request.urlopen(url, timeout=2) as response:
+                    return response.status == 200
+            except Exception:
+                return False
+
+        with ThreadPoolExecutor(max_workers=len(wanted)) as pool:
+            results = list(pool.map(lambda item: reachable(item[2]), wanted))
+        return [
+            {"name": name, "url": base, "remedy": remedy}
+            for (name, base, _probe_url, remedy), ok in zip(wanted, results)
+            if not ok
+        ]
+
     def run_to_stop(self, run_id: str) -> None:
         """Advance one run on the calling thread until it reaches its next
         stopping point (a human gate, completion, failure, or block).
@@ -672,6 +1060,53 @@ class StudioCoordinator:
                 run_id,
                 prompt,
                 seed,
+            )
+            return True
+
+    _MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+    def submit_manual_image_upload(self, run_id: str, image_bytes: bytes, filename: str) -> bool:
+        """Accept one human-supplied D1 candidate image instead of a generated one.
+
+        Treated as an additional *candidate*, exactly like the direct Qwen
+        Image path above: it still has to pass the same deterministic
+        chroma/quality gate every generated concept passes, because D2
+        depends on that gate's isolated alpha -- not because an upload is
+        second-class. An image without a clean, mostly edge-connected green
+        background will fail that gate, correctly, the same way a bad
+        generated render does, with a specific reason instead of a silent
+        bypass; see make_chroma_alpha's own docstring for why this never
+        falls back to a learned segmentation model.
+        """
+        if not image_bytes:
+            raise ValueError("no image was uploaded")
+        if len(image_bytes) > self._MAX_UPLOAD_BYTES:
+            raise ValueError(
+                f"uploaded image must be {self._MAX_UPLOAD_BYTES // (1024 * 1024)} MB or smaller"
+            )
+        try:
+            with Image.open(io.BytesIO(image_bytes)) as probe:
+                probe.verify()
+        except Exception as exc:
+            raise ValueError(f"not a readable image file: {type(exc).__name__}: {exc}") from exc
+        # Same synchronous precondition check as submit_manual_qwen_image(),
+        # for the same reason: refuse a stale request with an explanation
+        # instead of accepting it and failing inside the worker thread.
+        run = self.store.load(run_id)
+        if run.current_stage != "D1" or run.stage("D1").state != "awaiting_review":
+            raise ValueError(
+                "an uploaded candidate is available only while the D1 concept gate awaits review"
+            )
+        with self._lock:
+            current = self._jobs.get(run_id)
+            if current is not None and not current.done():
+                return False
+            self._stop_requested.discard(run_id)
+            self._jobs[run_id] = self._executor.submit(
+                self._run_manual_image_upload,
+                run_id,
+                image_bytes,
+                filename,
             )
             return True
 
@@ -1352,10 +1787,206 @@ class StudioCoordinator:
             self._clear_comfy(run_id)
             self._clear_stop(run_id)
 
+    def _run_manual_image_upload(self, run_id: str, image_bytes: bytes, filename: str) -> None:
+        """Run the human-uploaded D1 candidate path from the D1 human gate.
+
+        Mirrors _run_manual_qwen_image above with no ComfyUI render: the
+        uploaded bytes stand in for what a backend would have generated, and
+        everything downstream of that -- chroma alpha, deterministic
+        quality, equipment conformance, evidence, comparison board, Qwen
+        review -- is the same code every other D1 candidate runs through.
+        """
+        try:
+            run = self.store.load(run_id)
+            stage = run.stage("D1")
+            if run.current_stage != "D1" or stage.state != "awaiting_review":
+                self.store.event(
+                    run,
+                    "manual_image_upload_refused",
+                    {"stage_id": run.current_stage, "reason": "the D1 concept gate is no longer awaiting review"},
+                )
+                return
+            if run.spec is None:
+                raise RuntimeError("D1 requires the compiled D0 specification")
+
+            self._begin(run, "D1", "Preparing your uploaded candidate.")
+            stage = run.stage("D1")
+            iteration = stage.iteration
+            attempt_root = (
+                self.store.run_root(run.run_id)
+                / "D1_concept"
+                / f"iteration-{iteration:02d}"
+                / "manual_upload"
+            )
+            image = attempt_root / "candidate-1" / "upload.png"
+            image.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                with Image.open(io.BytesIO(image_bytes)) as uploaded:
+                    uploaded.convert("RGB").save(image, format="PNG")
+            except Exception as exc:
+                raise ValueError(f"could not decode the uploaded image: {type(exc).__name__}: {exc}") from exc
+
+            self._progress(run, "D1", 0.35, "Isolating the subject from its background.")
+            evidence_id = f"d1-i{iteration:02d}-candidate-upload-01"
+            alpha_preview = attempt_root / "candidate-1" / "geometry_ready_rgba.png"
+            alpha_error = ""
+            try:
+                alpha_metrics = make_chroma_alpha(image, alpha_preview)
+            except Exception as exc:
+                alpha_metrics = {"meaningful_alpha": False}
+                alpha_error = f"{type(exc).__name__}: {exc}"
+                alpha_preview = None
+            quality = assess_concept_image(
+                image,
+                alpha_preview,
+                minimum_score=run.concept_min_quality_score,
+            )
+            qwen = self._qwen_factory(run)
+            equipment = (
+                check_equipment_conformance(qwen, image, run.spec)
+                if callable(getattr(qwen, "visual_presence", None))
+                else EquipmentConformanceReport(conforms=True)
+            )
+            if alpha_preview is not None:
+                self.store.evidence(
+                    run,
+                    "D1",
+                    alpha_preview,
+                    evidence_id=f"{evidence_id}-geometry-ready-alpha",
+                    label="Deterministic geometry-ready alpha for your uploaded candidate",
+                    media_type="image/png",
+                    metrics={
+                        **alpha_metrics,
+                        "iteration": iteration,
+                        "selectable": False,
+                        "role": "geometry_ready_alpha",
+                        "source_evidence_id": evidence_id,
+                    },
+                )
+            metrics = _image_metrics(image)
+            metrics.update(
+                {
+                    "iteration": iteration,
+                    "selectable": equipment.conforms and quality.hard_requirements_satisfied,
+                    "operation_id": "human_uploaded_image",
+                    "workflow_strategy": "human_upload_v1",
+                    "concept_backend": "human_upload",
+                    "human_uploaded": True,
+                    "original_filename": filename[:200],
+                    "equipment_conformance_ok": equipment.conforms,
+                    "equipment_conformance_violations": "; ".join(equipment.violations),
+                    **quality.metrics,
+                    "quality_reasons": "; ".join(quality.reasons),
+                    "alpha_error": alpha_error,
+                }
+            )
+            self.store.evidence(
+                run,
+                "D1",
+                image,
+                evidence_id=evidence_id,
+                label=f"Your uploaded candidate, iteration {iteration}",
+                media_type="image/png",
+                metrics=metrics,
+            )
+            candidates = [(evidence_id, image, metrics)]
+            comparison_board = _concept_comparison_board(
+                self.store,
+                run,
+                stage,
+                candidates,
+                attempt_root / "previous_vs_uploaded_candidate.png",
+            )
+            self.store.evidence(
+                run,
+                "D1",
+                comparison_board,
+                evidence_id=f"d1-i{iteration:02d}-manual-upload-comparison-board",
+                label=f"Uploaded candidate comparison, iteration {iteration}",
+                media_type="image/png",
+                metrics={"iteration": iteration, "selectable": False},
+            )
+            self._progress(run, "D1", 0.82, "Qwen critic is reviewing your uploaded candidate against the typed contract.")
+            try:
+                review = qwen.review_concepts(
+                    run.spec,
+                    stage,
+                    candidates,
+                    comparison_board=comparison_board,
+                )
+            except Exception as exc:
+                review = StudioQwenReview(
+                    review_id=f"d1.manual-upload.unavailable-{iteration:02d}",
+                    stage_id="D1",
+                    iteration=iteration,
+                    summary="Your uploaded candidate was processed, but the Qwen critic did not complete.",
+                    issues=[f"Qwen critic error: {type(exc).__name__}: {exc}"],
+                    candidate_ranking=[evidence_id],
+                    recommended_evidence_id=None,
+                    recommended_changes=["Use your review comment to direct the next candidate."],
+                    confidence=0.0,
+                    hard_requirements_satisfied=False,
+                    request_human_review=True,
+                )
+            stage.qwen_reviews.append(review)
+            review_path = attempt_root / "qwen_review.json"
+            _write_json(review_path, review.model_dump(mode="json"))
+            self.store.evidence(
+                run,
+                "D1",
+                review_path,
+                evidence_id=f"d1-i{iteration:02d}-manual-upload-review",
+                label=f"Qwen review of your uploaded candidate, iteration {iteration}",
+                media_type="application/json",
+                metrics={"iteration": iteration, "selectable": False, "confidence": review.confidence},
+            )
+            stage.metrics = {
+                "iteration": iteration,
+                "candidate_count": 1,
+                "qwen_confidence": review.confidence,
+                "recommended_evidence_id": review.recommended_evidence_id or "",
+                "hard_requirements_satisfied": review.hard_requirements_satisfied,
+                "workflow_strategy": "human_upload_v1",
+                "human_uploaded": True,
+            }
+            stage.progress = 1
+            stage.finished_at = utc_now()
+            stage.state = "awaiting_review"
+            stage.message = "Your uploaded candidate and Qwen review are ready for approval or rejection."
+            run.state = "awaiting_review"
+            self.store.event(
+                run,
+                "manual_image_upload_ready",
+                {
+                    "stage_id": "D1",
+                    "iteration": iteration,
+                    "evidence_id": evidence_id,
+                    "recommended_evidence_id": review.recommended_evidence_id,
+                },
+            )
+        except Exception as exc:
+            if self._was_stopped(run_id):
+                self._mark_stopped(run_id)
+                return
+            run = self.store.load(run_id)
+            stage = run.stage(run.current_stage)
+            stage.state = "failed"
+            stage.error = f"{type(exc).__name__}: {exc}"
+            stage.message = "Your uploaded candidate could not be processed. Fix the issue and use Resume without losing history."
+            stage.finished_at = utc_now()
+            run.state = "failed"
+            self.store.event(
+                run,
+                "manual_image_upload_failed",
+                {"stage_id": stage.stage_id, "error": stage.error},
+            )
+        finally:
+            self._clear_stop(run_id)
+
     def _run_d0(self, run: StudioRun) -> None:
         self._begin(run, "D0", "Qwen is compiling the description into a production contract.")
         qwen = self._qwen_factory(run)
-        spec = qwen.compile_spec(run.description)
+        spec = qwen.compile_spec(run.compilation_brief())
         run.spec = spec
         run.title = spec.title
         root = self.store.run_root(run.run_id)

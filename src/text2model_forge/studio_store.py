@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import threading
@@ -28,13 +29,100 @@ from .studio_models import (
 _RUN_ID = re.compile(r"^[a-z0-9][a-z0-9_.-]*$")
 
 
+class StudioConflictError(RuntimeError):
+    """A caller tried to save a run based on stale persisted state."""
+
+
+class _WorkspaceMutex:
+    """A re-entrant process and cross-process workspace mutex.
+
+    Studio can be driven by the browser and the headless CLI. A plain RLock
+    protects threads inside one Python process but does nothing when both
+    entry points use the same workspace. This mutex keeps the fast in-process
+    lock and adds one advisory file lock shared by every process.
+    """
+
+    def __init__(self, lock_path: Path) -> None:
+        self.lock_path = lock_path
+        self._thread_lock = threading.RLock()
+        self._local = threading.local()
+
+    @staticmethod
+    def _lock_file(handle) -> None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+    @staticmethod
+    def _unlock_file(handle) -> None:
+        handle.seek(0)
+        if os.name == "nt":
+            import msvcrt
+
+            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    def __enter__(self):
+        self._thread_lock.acquire()
+        depth = getattr(self._local, "depth", 0)
+        if depth == 0:
+            handle = self.lock_path.open("a+b")
+            if handle.tell() == 0:
+                handle.write(b"\0")
+                handle.flush()
+            try:
+                self._lock_file(handle)
+            except Exception:
+                handle.close()
+                self._thread_lock.release()
+                raise
+            self._local.handle = handle
+        self._local.depth = depth + 1
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        depth = self._local.depth - 1
+        self._local.depth = depth
+        if depth == 0:
+            handle = self._local.handle
+            try:
+                self._unlock_file(handle)
+            finally:
+                handle.close()
+                del self._local.handle
+        self._thread_lock.release()
+
+
+_MUTEX_REGISTRY_LOCK = threading.Lock()
+_MUTEX_REGISTRY: dict[str, _WorkspaceMutex] = {}
+
+
+def _workspace_mutex(root: Path) -> _WorkspaceMutex:
+    key = os.path.normcase(str(root.resolve()))
+    with _MUTEX_REGISTRY_LOCK:
+        mutex = _MUTEX_REGISTRY.get(key)
+        if mutex is None:
+            mutex = _WorkspaceMutex(root / ".workspace.lock")
+            _MUTEX_REGISTRY[key] = mutex
+        return mutex
+
+
 class StudioStore:
     def __init__(self, workspace: str | Path) -> None:
         self.workspace = Path(workspace).resolve()
         self.root = self.workspace / "studio"
         self.runs_root = self.root / "runs"
         self.runs_root.mkdir(parents=True, exist_ok=True)
-        self._lock = threading.RLock()
+        self._lock = _workspace_mutex(self.root)
 
     def run_root(self, run_id: str) -> Path:
         if not _RUN_ID.fullmatch(run_id):
@@ -63,25 +151,50 @@ class StudioStore:
 
     def save(self, run: StudioRun) -> None:
         with self._lock:
-            run.updated_at = datetime.now(timezone.utc)
             path = self.run_root(run.run_id) / "run.json"
+            if path.is_file():
+                current = json.loads(path.read_text(encoding="utf-8"))
+                persisted_revision = int(current.get("revision", 0))
+                if persisted_revision != run.revision:
+                    raise StudioConflictError(
+                        f"studio run {run.run_id!r} changed after it was loaded "
+                        f"(expected revision {run.revision}, found {persisted_revision}); "
+                        "reload it and retry the action"
+                    )
+            elif run.revision != 0:
+                raise StudioConflictError(
+                    f"studio run {run.run_id!r} disappeared after it was loaded"
+                )
+            original_revision = run.revision
+            original_updated_at = run.updated_at
+            run.revision += 1
+            run.updated_at = datetime.now(timezone.utc)
             temporary = path.with_suffix(".json.tmp")
-            temporary.write_text(run.model_dump_json(indent=2) + "\n", encoding="utf-8")
-            # Path.replace() is atomic on POSIX but can still raise a transient
-            # PermissionError on Windows if another process or thread (real-time
-            # antivirus, an unlocked reader) briefly has run.json open at the
-            # exact moment of the rename. This is not a real conflict -- retry
-            # rather than fail the whole stage over a race that clears in
-            # milliseconds; only propagate if it is still happening after that.
-            attempts = 8
-            for attempt in range(attempts):
+            try:
+                temporary.write_text(run.model_dump_json(indent=2) + "\n", encoding="utf-8")
+                # Path.replace() is atomic on POSIX but can still raise a transient
+                # PermissionError on Windows if another process or thread (real-time
+                # antivirus, an unlocked reader) briefly has run.json open at the
+                # exact moment of the rename. This is not a real conflict -- retry
+                # rather than fail the whole stage over a race that clears in
+                # milliseconds; only propagate if it is still happening after that.
+                attempts = 8
+                for attempt in range(attempts):
+                    try:
+                        temporary.replace(path)
+                        return
+                    except PermissionError:
+                        if attempt == attempts - 1:
+                            raise
+                        time.sleep(0.05 * (attempt + 1))
+            except Exception:
+                run.revision = original_revision
+                run.updated_at = original_updated_at
                 try:
-                    temporary.replace(path)
-                    return
-                except PermissionError:
-                    if attempt == attempts - 1:
-                        raise
-                    time.sleep(0.05 * (attempt + 1))
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
 
     def list(self) -> list[StudioRun]:
         with self._lock:
@@ -169,6 +282,15 @@ class StudioStore:
 
     def event(self, run: StudioRun, event_type: str, payload: dict[str, Any]) -> None:
         with self._lock:
+            path = self.run_root(run.run_id) / "run.json"
+            if path.is_file():
+                current = json.loads(path.read_text(encoding="utf-8"))
+                persisted_revision = int(current.get("revision", 0))
+                if persisted_revision != run.revision:
+                    raise StudioConflictError(
+                        f"studio run {run.run_id!r} changed before event {event_type!r} "
+                        "could be recorded; reload it and retry the action"
+                    )
             run.event_count += 1
             record = {
                 "sequence": run.event_count,
@@ -177,9 +299,20 @@ class StudioStore:
                 "stage_id": run.current_stage,
                 "payload": payload,
             }
-            with (self.run_root(run.run_id) / "events.jsonl").open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(record, sort_keys=True) + "\n")
-            self.save(run)
+            events_path = self.run_root(run.run_id) / "events.jsonl"
+            original_size = events_path.stat().st_size if events_path.is_file() else 0
+            try:
+                with events_path.open("a", encoding="utf-8") as stream:
+                    stream.write(json.dumps(record, sort_keys=True) + "\n")
+                self.save(run)
+            except Exception:
+                run.event_count -= 1
+                try:
+                    with events_path.open("r+b") as stream:
+                        stream.truncate(original_size)
+                except OSError:
+                    pass
+                raise
 
     def read_events(self, run_id: str) -> list[dict[str, Any]]:
         path = self.run_root(run_id) / "events.jsonl"
@@ -198,24 +331,27 @@ class StudioStore:
         media_type: str,
         metrics: dict[str, float | int | bool | str | None] | None = None,
     ) -> StudioEvidence:
-        resolved = path.resolve()
-        root = self.run_root(run.run_id).resolve()
-        if root not in resolved.parents or not resolved.is_file():
-            raise ValueError("evidence must be a file inside the studio run")
-        digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
-        item = StudioEvidence(
-            evidence_id=evidence_id,
-            label=label,
-            relative_path=resolved.relative_to(root).as_posix(),
-            media_type=media_type,
-            sha256=digest,
-            metrics=metrics or {},
-        )
-        stage = run.stage(stage_id)
-        stage.evidence = [existing for existing in stage.evidence if existing.evidence_id != evidence_id]
-        stage.evidence.append(item)
-        self.save(run)
-        return item
+        with self._lock:
+            resolved = path.resolve()
+            root = self.run_root(run.run_id).resolve()
+            if root not in resolved.parents or not resolved.is_file():
+                raise ValueError("evidence must be a file inside the studio run")
+            digest = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            item = StudioEvidence(
+                evidence_id=evidence_id,
+                label=label,
+                relative_path=resolved.relative_to(root).as_posix(),
+                media_type=media_type,
+                sha256=digest,
+                metrics=metrics or {},
+            )
+            stage = run.stage(stage_id)
+            stage.evidence = [
+                existing for existing in stage.evidence if existing.evidence_id != evidence_id
+            ]
+            stage.evidence.append(item)
+            self.save(run)
+            return item
 
     _DECISIONS = {"approve", "reject", "retry", "edit", "skip", "rollback"}
 

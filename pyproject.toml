@@ -42,6 +42,7 @@ local-ai = [
 dev = [
   "build>=1.3,<2",
   "pip-audit>=2.10,<3",
+  "playwright>=1.60,<2",
   "pytest>=9.0.3,<10",
   # Randomizes test order every run. Earned its place: it caught a real
   # order/timing-dependent race in the Studio web test fixture that a fixed

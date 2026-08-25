@@ -35,12 +35,14 @@ from typing import Any, Literal
 from pydantic import Field
 
 from .config import load_local_config, worker_binding
+from .gpu import gpu_memory_snapshot
 from .hardware import (
     FINGER_WIDTH_M,
     REVIEWER_VRAM_GB,
     HardwareProfile,
     detect_hardware,
     recommend_stack,
+    reviewer_vram_requirement,
 )
 from .motion_library import load_motion_library, resolve_donor_motion_path
 from .paths import resource_root
@@ -347,6 +349,167 @@ def check_reviewer_context(settings: dict[str, Any]) -> Check:
         name="reviewer context window",
         status="ok",
         detail=f"{model} served with {served} tokens",
+    )
+
+
+# What each concept backend needs resident, mirroring
+# studio_pipeline._VramHandoff._COMFY_REQUIRED_GB. Duplicated deliberately:
+# preflight must not import the coordinator, and a drift between the two is
+# caught by test_concept_backend_envelopes_match_the_admission_gate.
+CONCEPT_BACKEND_VRAM_GB = {
+    "z_image_turbo": 6.5,
+    "qwen_image_2512": 6.5,
+    "qwen_image_edit_2511": 6.5,
+    "sdxl": 5.8,
+}
+
+
+def check_concept_backend_fits(hardware: HardwareProfile, settings: dict[str, Any]) -> Check:
+    """Can the selected image backend ever be admitted on this machine?
+
+    The gap this closes was expensive to find the hard way. Every other
+    memory check here asks about the *reviewer*, which is the smallest
+    model in the pipeline; nothing asked whether the image backend fits.
+    On a laptop GPU it usually does not: a Windows desktop with a browser,
+    an editor, and a vendor overlay can hold 2-3 GB of an 8 GB card before
+    any model loads, and every concept backend needs 5.8-6.5 GB plus the
+    safety margin. The run then compiles its contract at D0, reaches D1,
+    waits out the full unload timeout, and fails with "GPU memory did not
+    recover" -- a message about a symptom, minutes after the point where
+    the answer was already knowable.
+
+    Reported against *live* free memory plus whatever the reviewer would
+    release, because that is the real ceiling: total capacity is not
+    reachable while a desktop is running on the same card.
+    """
+    backend = str(settings.get("concept_backend", "") or "")
+    if backend in {"", "auto"}:
+        # "auto" resolves at run time against what is installed; the
+        # cheapest candidate is the honest bound to check.
+        required = min(CONCEPT_BACKEND_VRAM_GB.values())
+        label = "the cheapest available backend"
+    elif backend in CONCEPT_BACKEND_VRAM_GB:
+        required = CONCEPT_BACKEND_VRAM_GB[backend]
+        label = backend
+    else:
+        return Check(
+            name="concept backend fits in VRAM",
+            status="skip",
+            detail=f"no measured envelope for concept_backend {backend!r}",
+        )
+
+    margin = float(settings.get("gpu_safety_margin_gb", 0.75) or 0.75)
+    needed = required + margin
+    total = hardware.vram_total_gb
+    if not total:
+        return Check(
+            name="concept backend fits in VRAM",
+            status="skip",
+            detail="no GPU telemetry, so the image backend's fit cannot be proven",
+        )
+
+    snapshot = gpu_memory_snapshot()
+    device = (snapshot or {}).get("device") or {}
+    free_now = float(device.get("free_gb") or 0)
+    # The reviewer is unloaded before an image job, so whatever it holds
+    # *right now* is reclaimable. Measured from the server rather than
+    # assumed from the model name: adding a model's nominal size back while
+    # it is not actually resident double-counts memory that was never taken
+    # and reports a machine as ready when it is not.
+    reclaimable = 0.0
+    reviewer_root = str(settings.get("localdeploy_url", "")).rstrip("/")
+    if reviewer_root.endswith("/v1"):
+        reviewer_root = reviewer_root[: -len("/v1")]
+    if reviewer_root:
+        running = _http_json(reviewer_root + "/api/ps", timeout=4)
+        if isinstance(running, dict):
+            for item in running.get("models") or []:
+                resident = item.get("size_vram")
+                if isinstance(resident, (int, float)):
+                    reclaimable += float(resident) / (1024**3)
+    reachable = min(total, free_now + reclaimable) if free_now else total
+
+    if needed > total:
+        return Check(
+            name="concept backend fits in VRAM",
+            status="fail",
+            detail=(
+                f"{label} needs {needed:.2f} GB but the card only has {total:.2f} GB in total"
+            ),
+            remedy="Choose a smaller concept backend; this one cannot run on this GPU at any desktop load.",
+        )
+    if free_now and needed > reachable:
+        held = max(0.0, total - free_now - reclaimable)
+        return Check(
+            name="concept backend fits in VRAM",
+            status="fail",
+            detail=(
+                f"{label} needs {needed:.2f} GB free, but this machine can currently reach only "
+                f"{reachable:.2f} GB ({total:.2f} GB total, {held:.2f} GB held by other processes). "
+                "Every D1 attempt will wait out the unload timeout and then fail."
+            ),
+            remedy=(
+                "Close GPU-using applications -- a browser, an editor, or a vendor overlay are the "
+                f"usual holders of {held:.2f} GB -- or select a concept backend with a smaller envelope."
+            ),
+        )
+    return Check(
+        name="concept backend fits in VRAM",
+        status="ok",
+        detail=f"{label} needs {needed:.2f} GB; {reachable:.2f} GB is reachable on this machine",
+    )
+
+
+COMFY_CPU_OFFLOAD_FLAGS = ("--cpu", "--novram", "--lowvram")
+
+
+def check_comfy_memory_mode(settings: dict[str, Any]) -> Check:
+    """Is ComfyUI keeping weights on the GPU, or streaming them from RAM?
+
+    This is the failure mode with no error message. A ComfyUI launched with
+    --lowvram still renders every image correctly, so nothing reports a
+    problem -- it just moves weights across PCIe for each pass. Measured on
+    this pipeline: 8m52s of model initialization to produce 30s of
+    sampling, against 45s end to end for the identical render with the
+    model resident. A user watching that concludes the tool is broken, and
+    no log line disagrees with them.
+
+    Reported as a failure under a GPU-only device policy, because that
+    policy exists precisely to forbid silent CPU inference, and as a
+    warning otherwise, where the trade is a legitimate choice.
+    """
+    url = str(settings.get("comfy_url", "")).rstrip("/")
+    if not url:
+        return Check(name="ComfyUI keeps weights on the GPU", status="skip", detail="no comfy_url configured")
+    payload = _http_json(url + "/system_stats", timeout=6)
+    if payload is None:
+        return Check(
+            name="ComfyUI keeps weights on the GPU",
+            status="skip",
+            detail=f"{url} is not reachable, so its memory mode is unknown",
+        )
+    argv = [str(item) for item in (payload.get("system") or {}).get("argv") or []]
+    offload = [flag for flag in COMFY_CPU_OFFLOAD_FLAGS if flag in argv]
+    if not offload:
+        return Check(
+            name="ComfyUI keeps weights on the GPU",
+            status="ok",
+            detail="no CPU-offload flags; weights stay resident on the device",
+        )
+    strict = str(settings.get("device_policy", "")) in {"gpu_compute_only", "strict_device_only"}
+    return Check(
+        name="ComfyUI keeps weights on the GPU",
+        status="fail" if strict else "warn",
+        detail=(
+            f"ComfyUI is running with {' '.join(offload)}, so it streams model weights from "
+            "system RAM. Renders still succeed; they take minutes instead of seconds, with no "
+            "error to explain why."
+        ),
+        remedy=(
+            "Restart ComfyUI without those flags (--reserve-vram is fine and does not offload). "
+            "If the card genuinely cannot hold the model, choose a smaller concept backend "
+            "instead of streaming a large one."
+        ),
     )
 
 
@@ -751,6 +914,8 @@ def run_preflight(
             pool.submit(check_reviewer_fits, hardware, settings),
             pool.submit(check_device_policy, hardware, settings, stages),
             pool.submit(check_gpu_safety_margin, hardware, settings),
+            pool.submit(check_concept_backend_fits, hardware, settings),
+            pool.submit(check_comfy_memory_mode, settings),
             pool.submit(check_spec_strategy, settings),
             pool.submit(check_llm_endpoint, settings),
             pool.submit(check_reviewer_context, settings),

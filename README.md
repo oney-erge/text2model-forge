@@ -56,9 +56,32 @@ deleted.
 
 ## Start on a new machine
 
-Clone the repository, then run the native launcher. `start` is idempotent: it
-installs or repairs missing components and then starts Studio. Both launchers
-use bounded retries, prefer non-admin installation, request elevation only when
+Clone the repository, then run it. `run.ps1`/`run.sh` is the one-command
+entry point: it installs the control plane on first use (fast -- no GPU, no
+model downloads) and just starts Studio on every run after that.
+
+```powershell
+.\run.ps1          # Windows
+```
+
+```bash
+./run.sh           # Linux or macOS
+```
+
+Run it again any time; it is idempotent. Anything after the command is
+forwarded straight through to the full launcher below, so `.\run.ps1 doctor`
+or `./run.sh install --ai-stack qwen --accept-sdxl-license` both work.
+
+The core install opens a guided offline walkthrough from the first-run page.
+It creates a completed sample project with deterministic local PNG and GLB
+artifacts, explicit synthetic-evidence labels, recorded gates, and provenance.
+Use it to learn the interface before downloading a model stack. It is not a
+generation result or qualification evidence.
+
+For every install option -- the full local AI stack, repair, a deep doctor
+report -- use the native launcher directly. `start` is idempotent: it installs
+or repairs missing components and then starts Studio. Both launchers use
+bounded retries, prefer non-admin installation, request elevation only when
 needed, preserve an existing ignored `config.local.toml`, run a deterministic
 smoke test, and show step progress.
 
@@ -152,11 +175,18 @@ The lock files are hash-pinned exports from `pyproject.toml`; see
 
 ## Studio and headless control
 
-Studio binds to `127.0.0.1` by default. A new run exposes the simple, advanced,
-and 8 GB profiles together with model/backend choices. Each stage reports
-normalized progress, current work, produced evidence, and machine-actionable
-errors. The 8 GB profile is selected automatically when the detected primary
-GPU is in that class; all profiles remain manually selectable.
+Studio binds to `127.0.0.1` by default. Its primary UI is organized around
+projects, six user-facing production phases, large evidence previews, and one
+focused human-decision panel. The exact D0 to D10 stage record, generation
+settings, worker controls, metrics, and append-only event history remain under
+progressively disclosed technical views. The responsive layout reflows to a
+single column at phone widths without hiding gate decisions or evidence.
+
+A new project begins with a plain-language brief plus optional intended-use and
+must-have fields. Model, profile, checkpoint, candidate-budget, and device
+controls remain available under generation options. The 8 GB profile is
+selected automatically when the detected primary GPU is in that class; all
+profiles remain manually selectable.
 
 ```powershell
 python -m text2model_forge studio --workspace C:/Text2ModelForgeRuns --open-browser
@@ -171,6 +201,12 @@ At a gate, a person may approve, reject, retry, edit with parameter overrides,
 skip an inapplicable stage, or roll back. The AI recommendation has its own
 confirmation button and is never submitted automatically. Headless clients can
 record the same provenance with `--assisted-by-review-id <review-id>`.
+
+Read-only versioned endpoints are available at `/api/v1/projects`,
+`/api/v1/projects/<run-id>`, `/api/v1/projects/<run-id>/events`, and
+`/api/v1/system/setup-options`. Browser and CLI processes serialize workspace
+mutations through the same advisory lock, and stale revisions are rejected
+instead of silently replacing newer run state.
 
 ## Configuration and workers
 

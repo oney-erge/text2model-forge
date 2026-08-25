@@ -3,15 +3,9 @@ decisions without the browser control plane.
 
 This shares StudioStore and StudioCoordinator with text2model_forge.studio_web, so a
 decision recorded here advances the exact same persisted run a browser
-session would see on its next reload -- there is no separate state machine
-for the CLI to drift out of sync with.
-
-Single-process caveat: StudioStore's lock is a threading.RLock, not a
-cross-process file lock (see StudioServer's build_server() docstring for the
-same limitation on the web side). Do not run `text2model_forge studio decide` and
-`text2model_forge studio serve` against the same --workspace at the same time; a
-concurrent load-modify-save from each process can silently clobber the
-other's write.
+session would see on its next reload. StudioStore serializes workspace writes
+across processes and rejects stale revisions, so the CLI and browser cannot
+silently clobber one another.
 """
 from __future__ import annotations
 

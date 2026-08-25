@@ -299,9 +299,20 @@ class StudioStageState(StrictModel):
 
 class StudioRun(StrictModel):
     schema_version: Literal[1] = 1
+    # Optimistic concurrency token maintained by StudioStore. Older run.json
+    # files load as revision 0 and are upgraded on their next successful
+    # write. The field is part of the persisted contract so a browser process
+    # and a concurrent CLI process cannot silently overwrite each other.
+    revision: int = Field(default=0, ge=0)
     run_id: str = Field(pattern=r"^[a-z0-9][a-z0-9_.-]*$")
+    # Tutorial runs contain clearly-labelled deterministic sample artifacts.
+    # They exercise the same browser, evidence, and audit surfaces but are
+    # never presented as generated or qualification evidence.
+    run_mode: Literal["production", "tutorial"] = "production"
     source_revision: str | None = Field(default=None, pattern=r"^[0-9a-f]{40}$")
     description: str = Field(min_length=1)
+    intended_use: str | None = Field(default=None, max_length=120)
+    must_have_features: str | None = Field(default=None, max_length=1000)
     title: str = "New Text2Model Forge asset"
     state: Literal[
         "created", "running", "awaiting_review", "blocked", "failed", "completed"
@@ -378,6 +389,17 @@ class StudioRun(StrictModel):
             if item.stage_id == stage_id:
                 return item
         raise KeyError(stage_id)
+
+    def compilation_brief(self) -> str:
+        """Full D0 input without mutating the user's original description."""
+        context: list[str] = []
+        if self.intended_use:
+            context.append(f"Intended use: {self.intended_use}")
+        if self.must_have_features:
+            context.append(f"Must-have features: {self.must_have_features}")
+        if not context:
+            return self.description
+        return self.description + "\n\n" + "\n".join(context)
 
 
 def new_studio_run(

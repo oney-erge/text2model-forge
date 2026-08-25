@@ -73,6 +73,24 @@ jobs:
             bash ./text2model-forge.sh install --ai-stack core --include-dev --non-interactive --no-elevation --no-browser --max-attempts 1
           fi
 
+  browser-ui:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install development environment
+        run: |
+          python -m pip install --upgrade "pip==26.2.1" "setuptools==84.0.0"
+          python -m pip install --require-hashes -r requirements-dev.lock
+          python -m pip install --no-deps --no-build-isolation -e .
+      - name: Install Chromium
+        run: python -m playwright install --with-deps chromium
+      - name: Responsive browser flow
+        run: python -m pytest tests/test_studio_browser.py -q
+
   coupling:
     # Guards the extraction: this package must not grow a dependency back on
     # any specific consuming project, and must not regain the repo-root

@@ -32,6 +32,7 @@ from text2model_forge.studio_models import (
 )
 from text2model_forge.studio_pipeline import (
     StudioCoordinator,
+    _VramHandoff,
     _composite_inpaint_crop,
     _prepare_inpaint_crop,
 )
@@ -44,7 +45,7 @@ from text2model_forge.schemas import (
 )
 from text2model_forge.studio_qwen import ConceptCorrectionPlan, ConceptPlan, StudioQwen
 from text2model_forge.studio_qwen import RigidPartPlan, RigidStructurePlan, _history
-from text2model_forge.studio_store import StudioStore
+from text2model_forge.studio_store import StudioConflictError, StudioStore
 
 
 DESCRIPTION = (
@@ -2473,6 +2474,43 @@ def test_save_gives_up_after_persistent_permission_errors(
         store.save(run)
 
 
+def test_two_store_instances_reject_a_stale_save_instead_of_clobbering_it(
+    tmp_path: Path,
+) -> None:
+    first = StudioStore(tmp_path)
+    second = StudioStore(tmp_path)
+    first.create("shared-workspace-v1", DESCRIPTION)
+
+    first_view = first.load("shared-workspace-v1")
+    stale_second_view = second.load("shared-workspace-v1")
+    first_view.title = "Saved by the browser"
+    first.save(first_view)
+
+    stale_second_view.title = "Stale CLI overwrite"
+    with pytest.raises(StudioConflictError, match="changed after it was loaded"):
+        second.save(stale_second_view)
+
+    persisted = first.load("shared-workspace-v1")
+    assert persisted.title == "Saved by the browser"
+    assert persisted.revision == first_view.revision
+
+
+def test_stale_event_is_refused_before_it_is_appended(tmp_path: Path) -> None:
+    first = StudioStore(tmp_path)
+    second = StudioStore(tmp_path)
+    first.create("shared-events-v1", DESCRIPTION)
+    current = first.load("shared-events-v1")
+    stale = second.load("shared-events-v1")
+    current.title = "Current"
+    first.save(current)
+    before = first.read_events("shared-events-v1")
+
+    with pytest.raises(StudioConflictError, match="before event"):
+        second.event(stale, "stale_event", {})
+
+    assert first.read_events("shared-events-v1") == before
+
+
 def test_artifact_paths_cannot_escape_run(tmp_path: Path) -> None:
     store = StudioStore(tmp_path)
     store.create("footman-v3", DESCRIPTION)
@@ -2843,3 +2881,315 @@ def test_unselectable_evidence_still_cannot_be_approved(tmp_path: Path) -> None:
     store.save(run)
     with pytest.raises(ValueError, match="production candidate"):
         store.decide(run.run_id, "D2", "approve", "", item.evidence_id)
+
+
+def test_vram_handoff_classifies_an_absent_service_apart_from_a_refusing_one() -> None:
+    """The handoff guarantees the *other* service is not holding VRAM. A
+    refused TCP connection means that service is not running, so it holds
+    none and the postcondition already holds. A service that answered and
+    refused, or one that hung, must still fail closed.
+
+    Regression for a real D0 failure: with ComfyUI not installed, every
+    reviewer call died on `URLError: <urlopen error [WinError 10061] ...>`
+    before it ever reached the LLM.
+    """
+    import socket
+    import urllib.error
+
+    refused = urllib.error.URLError(ConnectionRefusedError(10061, "actively refused it"))
+    assert _VramHandoff._service_is_absent(refused) is True
+
+    answered_and_refused = urllib.error.HTTPError(
+        "http://127.0.0.1:8188/free", 500, "Internal Server Error", {}, None
+    )
+    assert _VramHandoff._service_is_absent(answered_and_refused) is False
+
+    hung = urllib.error.URLError(socket.timeout("timed out"))
+    assert _VramHandoff._service_is_absent(hung) is False
+
+
+def test_vram_handoff_proceeds_when_the_other_service_is_not_running(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """End to end through the proxy: an absent ComfyUI must not fail a
+    reviewer call under a fail-closed device policy, while a ComfyUI that
+    answers and refuses to unload still must."""
+    import urllib.error
+
+    from text2model_forge.studio_models import StudioRun
+
+    monkeypatch.setattr("text2model_forge.studio_pipeline.wait_for_free_vram", lambda *a, **k: None)
+    monkeypatch.setattr("text2model_forge.studio_pipeline.admit_gpu_memory", lambda *a, **k: None)
+    # This test is about the unload of the *other* service, so hold the
+    # service this call itself needs reachable; its own absence is covered
+    # by test_a_heavyweight_call_reports_an_absent_service_before_waiting.
+    monkeypatch.setattr(_VramHandoff, "_reachable", staticmethod(lambda url, timeout=2.0: True))
+
+    run = StudioRun(
+        run_id="handoff-probe",
+        description=DESCRIPTION,
+        comfy_url="http://127.0.0.1:9",
+        localdeploy_url="http://127.0.0.1:9/v1",
+        model="qwen3-vl:4b-instruct",
+        vram_handoff=True,
+        device_policy="gpu_compute_only",
+        stages=[],
+    )
+
+    class Inner:
+        def compile_spec(self, description: str) -> str:
+            return "reached the reviewer"
+
+    def absent(_url: str) -> None:
+        raise urllib.error.URLError(ConnectionRefusedError(10061, "actively refused it"))
+
+    monkeypatch.setattr(_VramHandoff, "_free_comfy", staticmethod(absent))
+    proxy = _VramHandoff.wrap_qwen(Inner(), run, tmp_path)
+    assert proxy.compile_spec(run.description) == "reached the reviewer"
+
+    def refuses(_url: str) -> None:
+        raise urllib.error.HTTPError("http://127.0.0.1:8188/free", 500, "boom", {}, None)
+
+    monkeypatch.setattr(_VramHandoff, "_free_comfy", staticmethod(refuses))
+    proxy = _VramHandoff.wrap_qwen(Inner(), run, tmp_path)
+    with pytest.raises(urllib.error.HTTPError):
+        proxy.compile_spec(run.description)
+
+
+def test_a_heavyweight_call_reports_an_absent_service_before_waiting_on_memory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Order of checks. With ComfyUI not installed, D1 used to acquire the
+    GPU lease, unload the reviewer, then wait out the full unload timeout
+    and fail with "GPU memory did not recover within 60s" -- a message about
+    a symptom, naming neither the missing service nor anything actionable.
+    The reachability check must come first, and must not wait."""
+    from text2model_forge.studio_models import StudioRun
+
+    def must_not_run(*args, **kwargs):
+        raise AssertionError("memory was waited on before the service was checked")
+
+    monkeypatch.setattr("text2model_forge.studio_pipeline.wait_for_free_vram", must_not_run)
+    monkeypatch.setattr("text2model_forge.studio_pipeline.admit_gpu_memory", must_not_run)
+
+    run = StudioRun(
+        run_id="absent-comfy",
+        description=DESCRIPTION,
+        comfy_url="http://127.0.0.1:9",
+        localdeploy_url="http://127.0.0.1:9/v1",
+        vram_handoff=True,
+        device_policy="gpu_compute_only",
+        stages=[],
+    )
+
+    class Inner:
+        def generate(self, *, workflow, destination, timeout_seconds=900):
+            raise AssertionError("ComfyUI was called even though it is not running")
+
+    proxy = _VramHandoff.wrap_comfy(Inner(), run, tmp_path)
+    with pytest.raises(RuntimeError, match="ComfyUI is not reachable"):
+        proxy.generate(workflow={}, destination=tmp_path, timeout_seconds=5)
+
+
+def test_concept_backend_envelopes_match_the_admission_gate() -> None:
+    """preflight duplicates the coordinator's VRAM envelopes so it need not
+    import it. If the two drift, preflight blesses a machine the admission
+    gate will then refuse -- exactly the class of failure the check exists
+    to prevent."""
+    from text2model_forge.preflight import CONCEPT_BACKEND_VRAM_GB
+
+    for backend, required in CONCEPT_BACKEND_VRAM_GB.items():
+        assert _VramHandoff._COMFY_REQUIRED_GB[backend] == required, backend
+
+
+def test_preflight_fails_when_no_concept_backend_can_fit_the_free_vram(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The missing check behind every "it just keeps failing" report: an 8 GB
+    laptop card whose desktop already holds ~2.6 GB can never reach the
+    6.55 GB the cheapest image backend needs, so every run dies at D1. The
+    reviewer's *currently resident* size counts as reclaimable; its nominal
+    size must not, or an idle machine is reported as ready when it is not.
+    """
+    from text2model_forge.hardware import GpuInfo, HardwareProfile
+    from text2model_forge.preflight import check_concept_backend_fits
+
+    hardware = HardwareProfile(
+        detected=True,
+        source="nvidia-smi",
+        gpus=[GpuInfo(name="RTX 3080 Laptop", backend="CUDA", vram_total_gb=8.0)],
+    )
+    settings = {
+        "concept_backend": "sdxl",
+        "gpu_safety_margin_gb": 0.75,
+        "model": "qwen3-vl:4b-instruct",
+        "localdeploy_url": "http://127.0.0.1:9/v1",
+    }
+
+    monkeypatch.setattr(
+        "text2model_forge.preflight.gpu_memory_snapshot",
+        lambda: {"device": {"total_gb": 8.0, "free_gb": 5.22}},
+    )
+    monkeypatch.setattr("text2model_forge.preflight._http_json", lambda url, timeout=8.0: None)
+
+    failing = check_concept_backend_fits(hardware, settings)
+    assert failing.status == "fail"
+    assert "6.55" in failing.detail and "5.22" in failing.detail
+    assert failing.remedy
+
+    # Same machine, but the reviewer is resident and will be unloaded first.
+    monkeypatch.setattr(
+        "text2model_forge.preflight._http_json",
+        lambda url, timeout=8.0: {"models": [{"size_vram": 2.0 * 1024**3}]},
+    )
+    with_reclaim = check_concept_backend_fits(hardware, settings)
+    assert with_reclaim.status == "ok"
+
+
+def test_progress_telemetry_path_executes_without_a_missing_import(tmp_path: Path) -> None:
+    """A real D1 run crashed with `NameError: name 'time' is not defined`
+    inside _progress()'s GPU-telemetry throttle. The whole deterministic
+    suite passed anyway, because every fake-backed test leaves telemetry
+    disabled, so the two lines that reference `time` never executed. This
+    drives _progress() with telemetry ON, which is the only way that branch
+    is reached.
+    """
+    store = StudioStore(tmp_path)
+    run = store.create("telemetry-probe", DESCRIPTION, {})
+    coordinator = StudioCoordinator(
+        store,
+        qwen_factory=lambda run: FakeQwen(),
+        comfy_factory=lambda run: FakeComfy(),
+        worker_executor=FakeWorkerExecutor(),
+    )
+    try:
+        coordinator._telemetry_enabled = True
+        coordinator._last_gpu_snapshot_at = 0.0
+        coordinator._progress(run, "D0", 0.5, "probing the telemetry branch")
+    finally:
+        coordinator.close()
+
+    assert run.stage("D0").message == "probing the telemetry branch"
+
+
+def test_failed_atomic_save_restores_the_in_memory_revision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StudioStore(tmp_path)
+    run = store.create("failed-save", DESCRIPTION, {})
+    original_revision = run.revision
+    original_updated_at = run.updated_at
+    original_write_text = Path.write_text
+
+    def fail_temporary_write(path: Path, *args, **kwargs):
+        if path.name == "run.json.tmp":
+            raise OSError("simulated disk failure")
+        return original_write_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "write_text", fail_temporary_write)
+    run.title = "This mutation must remain unsaved"
+
+    with pytest.raises(OSError, match="simulated disk failure"):
+        store.save(run)
+
+    assert run.revision == original_revision
+    assert run.updated_at == original_updated_at
+    assert store.load(run.run_id).title != run.title
+
+
+def test_failed_event_save_removes_the_uncommitted_jsonl_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store = StudioStore(tmp_path)
+    run = store.create("failed-event", DESCRIPTION, {})
+    events_path = store.run_root(run.run_id) / "events.jsonl"
+    original_events = events_path.read_bytes()
+    original_count = run.event_count
+
+    def fail_save(_run):
+        raise OSError("simulated run save failure")
+
+    monkeypatch.setattr(store, "save", fail_save)
+    with pytest.raises(OSError, match="simulated run save failure"):
+        store.event(run, "uncommitted_event", {"value": 1})
+
+    assert run.event_count == original_count
+    assert events_path.read_bytes() == original_events
+
+
+def test_gpu_only_policy_rejects_a_comfyui_that_streams_weights_from_ram(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure mode with no error message. A ComfyUI started with
+    --lowvram renders correctly but streams weights across PCIe: measured
+    at 8m52s of model initialization for 30s of sampling, against 45s for
+    the same render resident. Nothing logged a problem, so it read as "the
+    tool is broken". gpu_compute_only already forbade CPU *nodes*; it now
+    forbids a CPU-offloading *server* too, which is the same policy applied
+    to the thing that actually decides where the weights live.
+    """
+    from text2model_forge.studio_models import StudioRun
+
+    run = StudioRun(
+        run_id="offload-guard",
+        description=DESCRIPTION,
+        comfy_url="http://127.0.0.1:8188",
+        localdeploy_url="http://127.0.0.1:11434/v1",
+        vram_handoff=True,
+        device_policy="gpu_compute_only",
+        stages=[],
+    )
+
+    monkeypatch.setattr(
+        _VramHandoff, "_comfy_offload_flags", staticmethod(lambda url: ["--lowvram"])
+    )
+
+    class Inner:
+        def generate(self, *, workflow, destination, timeout_seconds=900):
+            raise AssertionError("a streaming ComfyUI must not be used under a GPU-only policy")
+
+    proxy = _VramHandoff.wrap_comfy(Inner(), run, tmp_path)
+    with pytest.raises(RuntimeError, match="--lowvram"):
+        proxy.generate(workflow={"1": {"class_type": "KSampler", "inputs": {}}}, destination=tmp_path)
+
+    # prefer_gpu is the explicitly degraded mode and must still allow it.
+    monkeypatch.setattr(_VramHandoff, "_reachable", staticmethod(lambda url, timeout=2.0: True))
+    monkeypatch.setattr(_VramHandoff, "_comfy_free_gb", staticmethod(lambda url: 99.0))
+    lenient = run.model_copy(update={"device_policy": "prefer_gpu"})
+
+    class Ok:
+        def generate(self, *, workflow, destination, timeout_seconds=900):
+            return ["rendered"]
+
+    assert _VramHandoff.wrap_comfy(Ok(), lenient, tmp_path).generate(
+        workflow={"1": {"class_type": "KSampler", "inputs": {}}}, destination=tmp_path
+    ) == ["rendered"]
+
+
+def test_preflight_reports_a_streaming_comfyui_before_the_run_starts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The same guard, one step earlier: caught in the readiness report
+    rather than minutes into a render."""
+    from text2model_forge.preflight import check_comfy_memory_mode
+
+    monkeypatch.setattr(
+        "text2model_forge.preflight._http_json",
+        lambda url, timeout=8.0: {"system": {"argv": ["main.py", "--lowvram", "--port", "8188"]}},
+    )
+    strict = check_comfy_memory_mode(
+        {"comfy_url": "http://127.0.0.1:8188", "device_policy": "gpu_compute_only"}
+    )
+    assert strict.status == "fail"
+    assert "--lowvram" in strict.detail and strict.remedy
+
+    lenient = check_comfy_memory_mode(
+        {"comfy_url": "http://127.0.0.1:8188", "device_policy": "prefer_gpu"}
+    )
+    assert lenient.status == "warn"
+
+    monkeypatch.setattr(
+        "text2model_forge.preflight._http_json",
+        lambda url, timeout=8.0: {"system": {"argv": ["main.py", "--reserve-vram", "0.4"]}},
+    )
+    assert check_comfy_memory_mode({"comfy_url": "http://127.0.0.1:8188"}).status == "ok"

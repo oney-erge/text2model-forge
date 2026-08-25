@@ -566,6 +566,25 @@ class StudioComfyClient:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
 
+    def _failure(self, what: str, exc: Exception) -> StudioComfyError:
+        """One message for every way a ComfyUI call can fail.
+
+        "ComfyUI request failed for /models/controlnet: <urlopen error
+        [WinError 10061] ...>" is what a real D1 produced on a machine
+        without ComfyUI installed: it reads like an internal fault when the
+        answer is simply that the service was never started. A refused
+        connection is that case and nothing else, so it gets the remedy
+        instead of the traceback.
+        """
+        reason = getattr(exc, "reason", exc)
+        if isinstance(reason, ConnectionError):
+            return StudioComfyError(
+                f"ComfyUI is not running at {self.base_url}, so {what} could not complete. "
+                "Start it with: python main.py --listen 127.0.0.1 --port 8188 "
+                "--normalvram --reserve-vram 0.75 --preview-method none"
+            )
+        return StudioComfyError(f"ComfyUI request failed for {what}: {exc}")
+
     def _json(self, path: str, payload: dict[str, Any] | None = None) -> Any:
         data = json.dumps(payload).encode("utf-8") if payload is not None else None
         request = urllib.request.Request(
@@ -582,7 +601,7 @@ class StudioComfyClient:
                 # of misreporting it as a JSON failure.
                 return json.loads(body) if body.strip() else None
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise StudioComfyError(f"ComfyUI request failed for {path}: {exc}") from exc
+            raise self._failure(path, exc) from exc
 
     def health(self) -> dict[str, Any]:
         value = self._json("/system_stats")
@@ -639,7 +658,7 @@ class StudioComfyClient:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 value = json.loads(response.read().decode("utf-8"))
         except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-            raise StudioComfyError(f"ComfyUI image upload failed for {name}: {exc}") from exc
+            raise self._failure(f"uploading {name}", exc) from exc
         stored = str(value.get("name", name))
         stored_subfolder = str(value.get("subfolder", subfolder))
         return f"{stored_subfolder}/{stored}" if stored_subfolder else stored

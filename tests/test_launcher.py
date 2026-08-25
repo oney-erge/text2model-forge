@@ -9,6 +9,8 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 POWERSHELL = ROOT / "text2model-forge.ps1"
 SHELL = ROOT / "text2model-forge.sh"
+RUN_PS1 = ROOT / "run.ps1"
+RUN_SH = ROOT / "run.sh"
 
 
 def test_windows_launcher_exposes_bounded_install_start_and_ai_choices() -> None:
@@ -88,6 +90,64 @@ def test_docker_setup_is_local_only_persistent_and_uses_typed_config() -> None:
     assert config["workspace_root"] == "/workspace"
     assert config["studio_defaults"]["localdeploy_url"] == "http://ollama:11434/v1"
     assert config["studio_defaults"]["comfy_url"] == "http://host.docker.internal:8188"
+
+
+def test_run_wrapper_scripts_forward_to_the_real_launchers_with_a_fast_default_stack() -> None:
+    """run.ps1/run.sh exist so this repo is discoverable the same way as the
+    account's other repos (MetaScout, Agentarium both use run.ps1/run.sh).
+    They must not duplicate installer logic -- they are a thin front door
+    that defaults to the fast core stack and delegates everything else to
+    the real, already-tested launcher."""
+    ps1 = RUN_PS1.read_text(encoding="utf-8")
+    assert 'Join-Path $PSScriptRoot "text2model-forge.ps1"' in ps1
+    assert '"-AiStack", "core"' in ps1
+    assert "-contains \"-AiStack\"" in ps1
+    assert "$forwardArgs" in ps1
+
+    sh = RUN_SH.read_text(encoding="utf-8")
+    assert sh.startswith("#!/usr/bin/env bash")
+    assert "exec ./text2model-forge.sh" in sh
+    assert "--ai-stack core" in sh
+    assert '"$arg" = "--ai-stack"' in sh
+
+
+def test_run_ps1_wrapper_parses_when_powershell_is_available() -> None:
+    executable = shutil.which("powershell") or shutil.which("pwsh")
+    if executable is None:
+        pytest.skip("PowerShell is not installed on this test host")
+    path = str(RUN_PS1).replace("'", "''")
+    command = (
+        "$tokens=$null; $errors=$null; "
+        f"[System.Management.Automation.Language.Parser]::ParseFile('{path}', [ref]$tokens, [ref]$errors) | Out-Null; "
+        "if ($errors.Count) { $errors | ForEach-Object { Write-Error $_.Message }; exit 1 }"
+    )
+    subprocess.run(
+        [executable, "-NoLogo", "-NoProfile", "-Command", command],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_run_sh_wrapper_parses_when_a_real_bash_is_available() -> None:
+    candidates = [
+        Path(r"C:\Program Files\Git\bin\bash.exe"),
+        Path(r"C:\Program Files (x86)\Git\bin\bash.exe"),
+    ]
+    discovered = shutil.which("bash")
+    if discovered:
+        candidates.append(Path(discovered))
+    executable = next((path for path in candidates if path.is_file()), None)
+    if executable is None:
+        pytest.skip("Bash is not installed on this test host")
+    subprocess.run(
+        [str(executable), "-n", str(RUN_SH)],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_powershell_launcher_parses_when_powershell_is_available() -> None:
