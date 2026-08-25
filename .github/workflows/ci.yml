@@ -60,6 +60,7 @@ jobs:
             # PowerShell must receive literal dollar signs.
             # shellcheck disable=SC2016
             pwsh -NoProfile -Command '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./run.ps1), [ref]$null, [ref]$errors); if ($errors.Count) { $errors | Format-List | Out-String | Write-Error }'
+            # shellcheck disable=SC2016
             pwsh -NoProfile -Command '$errors = $null; [void][System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path ./text2model-forge.ps1), [ref]$null, [ref]$errors); if ($errors.Count) { $errors | Format-List | Out-String | Write-Error }'
           else
             bash -n ./run.sh ./run.command ./text2model-forge.sh
