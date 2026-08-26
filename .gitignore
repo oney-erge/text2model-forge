@@ -1,4 +1,5 @@
 # Machine-local config: real binary paths and env vars, never portable.
+.setup/
 config.local.toml
 config.local.json
 # The container sample has no machine paths or credentials and is intentionally

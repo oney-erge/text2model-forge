@@ -5,6 +5,9 @@ set -Eeuo pipefail
 umask 022
 
 REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+source "${REPO_ROOT}/scripts/install-utils.sh"
+install_init "$REPO_ROOT" "Asset Forge"
+install_enable_traps
 ACTION="start"
 AI_STACK="auto"
 GPU="auto"
@@ -77,6 +80,8 @@ on_error() {
     local line_number=${1:-unknown}
     printf '\nText2Model Forge stopped at line %s (exit %s).\n' "$line_number" "$exit_code" >&2
     printf 'Run ./text2model-forge.sh doctor for a readiness report.\n' >&2
+    install_note "failure exit=$exit_code line=$line_number"
+    install_unlock
     exit "$exit_code"
 }
 trap 'on_error $LINENO' ERR
@@ -142,36 +147,7 @@ write_step() {
 with_retry() {
     local label=$1
     shift
-    local attempt=1 delay
-    while true; do
-        if "$@"; then
-            return 0
-        fi
-        if (( attempt >= MAX_ATTEMPTS )); then
-            printf '%s failed after %s attempt(s).\n' "$label" "$MAX_ATTEMPTS" >&2
-            return 1
-        fi
-        delay=$((1 << (attempt - 1)))
-        (( delay > 8 )) && delay=8
-        printf '%s failed on attempt %s/%s; retrying in %ss.\n' "$label" "$attempt" "$MAX_ATTEMPTS" "$delay" >&2
-        sleep "$delay"
-        attempt=$((attempt + 1))
-    done
-}
-
-download_once() {
-    local url=$1 destination=$2 partial="${2}.partial"
-    mkdir -p -- "$(dirname -- "$destination")"
-    rm -f -- "$partial"
-    if command -v curl >/dev/null 2>&1; then
-        curl --fail --location --progress-bar --output "$partial" "$url"
-    elif command -v wget >/dev/null 2>&1; then
-        wget --progress=bar:force:noscroll --output-document="$partial" "$url"
-    else
-        printf 'curl or wget is required to download %s\n' "$url" >&2
-        return 1
-    fi
-    mv -f -- "$partial" "$destination"
+    INSTALL_RETRY_ATTEMPTS="$MAX_ATTEMPTS" install_retry "$label" "$@"
 }
 
 download_file() {
@@ -180,7 +156,7 @@ download_file() {
         printf '%s is already downloaded.\n' "$label"
         return 0
     fi
-    with_retry "$label download" download_once "$url" "$destination"
+    install_download "$url" "$destination" "$label"
 }
 
 python_is_compatible() {
@@ -694,6 +670,8 @@ main() {
     fi
     selected_stack="$(resolve_ai_stack)"
     [[ "$selected_stack" == qwen || "$selected_stack" == sdxl ]] && full_stack=1
+    install_lock
+    if (( full_stack )); then install_require_space "$REPO_ROOT" 25; else install_require_space "$REPO_ROOT" 3; fi
     [[ "$ACTION" == install || "$ACTION" == repair ]] && install_only=1
     if (( full_stack )); then
         (( install_only )) && TOTAL_STEPS=8 || TOTAL_STEPS=9
@@ -722,9 +700,11 @@ main() {
         write_step "Installation complete"
         show_doctor
         printf '\nInstall complete. Run ./text2model-forge.sh to start Studio.\n'
+        install_complete
         return 0
     fi
 
+    install_complete
     write_step "Starting local AI services"
     if [[ "$selected_stack" == qwen || "$selected_stack" == sdxl || "$selected_stack" == existing ]]; then
         ollama_bin="$(find_ollama || true)"

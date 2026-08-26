@@ -33,6 +33,8 @@ if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) {
 }
 
 $script:RepoRoot = [IO.Path]::GetFullPath($PSScriptRoot)
+. (Join-Path $script:RepoRoot "scripts\install-utils.ps1")
+Initialize-Install -RepositoryRoot $script:RepoRoot -ProductName "Asset Forge"
 if (-not $Workspace) {
     $Workspace = Join-Path $env:USERPROFILE "Text2ModelForgeRuns"
 }
@@ -69,21 +71,7 @@ function Invoke-WithRetry {
         [scriptblock]$Operation,
         [int]$Attempts = $MaxAttempts
     )
-    $lastError = $null
-    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        try {
-            & $Operation
-            return
-        }
-        catch {
-            $lastError = $_
-            if ($attempt -ge $Attempts) { break }
-            $delay = [Math]::Min(8, [Math]::Pow(2, $attempt - 1))
-            Write-Warning "$Name failed on attempt $attempt/$Attempts`: $($_.Exception.Message). Retrying in $delay second(s)."
-            Start-Sleep -Seconds $delay
-        }
-    }
-    throw "$Name failed after $Attempts attempt(s): $($lastError.Exception.Message)"
+    Invoke-InstallRetry -Label $Name -Operation $Operation -Attempts $Attempts
 }
 
 function Invoke-Native {
@@ -647,6 +635,8 @@ try {
 
     $selectedStack = Resolve-AiStack
     $fullStack = $selectedStack -in @("qwen", "sdxl")
+    Enter-InstallLock
+    Assert-InstallFreeSpace -Path $script:RepoRoot -RequiredGB $(if ($fullStack) { 25 } else { 3 })
     $installOnly = $Action -in @("install", "repair")
     $script:TotalSteps = if ($fullStack) { if ($installOnly) { 8 } else { 9 } } else { if ($installOnly) { 5 } else { 6 } }
     Write-Host "Text2Model Forge action: $Action; AI stack: $selectedStack; workspace: $Workspace" -ForegroundColor White
@@ -689,9 +679,11 @@ try {
         [void](Show-Doctor)
         Write-Progress -Id 1 -Activity "Text2Model Forge setup" -Completed
         Write-Host "`nInstall complete. Run .\text2model-forge.ps1 to start Studio." -ForegroundColor Green
+        Complete-Install
         exit 0
     }
 
+    Complete-Install
     Write-Step "Starting local AI services"
     if ($selectedStack -in @("qwen", "sdxl", "existing")) {
         $ollama = Find-Ollama
@@ -709,6 +701,8 @@ try {
     Invoke-Native $script:VenvPython $studioArguments
 }
 catch {
+    Write-InstallFailure $_
+    Exit-InstallLock
     Write-Progress -Id 1 -Activity "Text2Model Forge setup" -Completed
     Write-Host "`nText2Model Forge could not finish: $($_.Exception.Message)" -ForegroundColor Red
     Write-Host "Run .\text2model-forge.ps1 -Action doctor for a readiness report." -ForegroundColor Yellow

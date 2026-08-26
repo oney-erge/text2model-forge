@@ -93,6 +93,10 @@ bounded retries, prefer non-admin installation, request elevation only when
 needed, preserve an existing ignored `config.local.toml`, run a deterministic
 smoke test, and show step progress.
 
+Setup also checks free disk space before large model downloads, prevents two
+installs from changing the managed environment at once, and records failures in
+`.setup/install.log`.
+
 Windows PowerShell:
 
 ```powershell
