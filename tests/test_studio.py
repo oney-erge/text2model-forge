@@ -2920,6 +2920,7 @@ def test_vram_handoff_proceeds_when_the_other_service_is_not_running(
 
     monkeypatch.setattr("text2model_forge.studio_pipeline.wait_for_free_vram", lambda *a, **k: None)
     monkeypatch.setattr("text2model_forge.studio_pipeline.admit_gpu_memory", lambda *a, **k: None)
+    monkeypatch.setattr("text2model_forge.studio_pipeline.gpu_memory_snapshot", lambda: None)
     # This test is about the unload of the *other* service, so hold the
     # service this call itself needs reachable; its own absence is covered
     # by test_a_heavyweight_call_reports_an_absent_service_before_waiting.

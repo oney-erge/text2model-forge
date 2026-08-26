@@ -130,5 +130,6 @@ def test_review_gate_remains_usable_at_desktop_and_phone_widths(browser_studio) 
             page.set_viewport_size({"width": width, "height": 844})
             page.reload(wait_until="networkidle")
             assert page.evaluate("document.documentElement.scrollWidth") == width
+            assert page.locator("#human-decision").evaluate("form => form.scrollWidth <= form.clientWidth")
             assert page.get_by_role("button", name="Approve and continue").is_visible()
         browser.close()

@@ -109,7 +109,9 @@ def test_decide_with_no_resume_only_records_the_decision(tmp_path: Path) -> None
     assert result["current_stage"] == "D1"
 
 
-def test_run_to_stop_refuses_a_concurrent_job_on_the_same_coordinator(tmp_path: Path) -> None:
+def test_run_to_stop_refuses_a_concurrent_job_on_the_same_coordinator(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Regression-shaped: run_to_stop() must not silently start a second
     _drive() over the same run while one is already active on this
     coordinator -- that would race on run.json writes from two threads."""
@@ -127,7 +129,22 @@ def test_run_to_stop_refuses_a_concurrent_job_on_the_same_coordinator(tmp_path: 
         assert coordinator.submit("cli-concurrent-v1")
         with pytest.raises(RuntimeError, match="already running"):
             coordinator.run_to_stop("cli-concurrent-v1")
+
+        original_event = store.event
+        inserted_concurrent_event = False
+
+        def event_after_concurrent_write(run, event_type, payload):
+            nonlocal inserted_concurrent_event
+            if event_type == "human_stop_requested" and not inserted_concurrent_event:
+                inserted_concurrent_event = True
+                latest = store.load("cli-concurrent-v1")
+                original_event(latest, "concurrent_test_event", {})
+            return original_event(run, event_type, payload)
+
+        monkeypatch.setattr(store, "event", event_after_concurrent_write)
         coordinator.stop("cli-concurrent-v1")
+        assert inserted_concurrent_event
+        assert any(event["event_type"] == "human_stop_requested" for event in store.read_events("cli-concurrent-v1"))
         deadline = time.monotonic() + 5
         while time.monotonic() < deadline and coordinator.busy("cli-concurrent-v1"):
             time.sleep(0.02)

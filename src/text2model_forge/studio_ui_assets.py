@@ -474,6 +474,7 @@ code { padding: 2px 5px; }
   .hero-actions > *, .actions > *, button, .button { width: 100%; }
   .timeline .stage { flex-basis: 118px; }
   .glb-preview { height: 360px; }
+  .decision-primary { margin-inline: 0; padding-inline: 0; }
   .decision-more .actions { grid-template-columns: minmax(0, 1fr); }
 }
 

@@ -61,7 +61,7 @@ from .studio_models import (
     validate_stage_overrides,
 )
 from .studio_qwen import ConceptCorrectionPlan, ConceptPlan, StudioQwen
-from .studio_store import StudioStore
+from .studio_store import StudioConflictError, StudioStore
 from .workers import WorkerManager
 
 
@@ -1157,12 +1157,18 @@ class StudioCoordinator:
         )
 
     def _record_stop_requested(self, run_id: str) -> None:
-        run = self.store.load(run_id)
-        self.store.event(
-            run,
-            "human_stop_requested",
-            {"stage_id": run.current_stage, "iteration": run.stage(run.current_stage).iteration},
-        )
+        for attempt in range(8):
+            run = self.store.load(run_id)
+            try:
+                self.store.event(
+                    run,
+                    "human_stop_requested",
+                    {"stage_id": run.current_stage, "iteration": run.stage(run.current_stage).iteration},
+                )
+                return
+            except StudioConflictError:
+                if attempt == 7:
+                    raise
 
     def stop(self, run_id: str) -> tuple[bool, str]:
         """Interrupt only the currently tracked Studio workflow, never an arbitrary process."""
