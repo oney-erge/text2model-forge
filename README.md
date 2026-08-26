@@ -56,17 +56,20 @@ deleted.
 
 ## Start on a new machine
 
-Clone the repository, then run it. `run.ps1`/`run.sh` is the one-command
-entry point: it installs the control plane on first use (fast -- no GPU, no
+Clone the repository, then use the root launcher for your platform. It installs
+the control plane on first use (fast -- no GPU, no
 model downloads) and just starts Studio on every run after that.
 
 ```powershell
-.\run.ps1          # Windows
+.\run.bat          # Windows
 ```
 
 ```bash
-./run.sh           # Linux or macOS
+./run.command      # macOS
+./run.sh           # Linux
 ```
+
+PowerShell users can run `.\run.ps1` directly.
 
 Run it again any time; it is idempotent. Anything after the command is
 forwarded straight through to the full launcher below, so `.\run.ps1 doctor`
