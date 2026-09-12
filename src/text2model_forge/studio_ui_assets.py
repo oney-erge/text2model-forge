@@ -32,7 +32,7 @@ MODERN_STYLE = r"""
 }
 
 * { box-sizing: border-box; }
-html { min-width: 0; background: var(--bg); }
+html { min-width: 0; overflow-x: hidden; background: var(--bg); }
 body {
   min-width: 0;
   margin: 0;
