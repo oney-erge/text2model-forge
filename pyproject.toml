@@ -48,7 +48,7 @@ dev = [
   # order/timing-dependent race in the Studio web test fixture that a fixed
   # order never surfaced.
   "pytest-randomly>=3,<6",
-  "pytest-cov>=5,<7",
+  "pytest-cov>=5,<8",
 ]
 
 [project.scripts]
