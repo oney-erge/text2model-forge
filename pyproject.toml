@@ -47,7 +47,7 @@ dev = [
   # Randomizes test order every run. Earned its place: it caught a real
   # order/timing-dependent race in the Studio web test fixture that a fixed
   # order never surfaced.
-  "pytest-randomly>=3,<4",
+  "pytest-randomly>=3,<6",
   "pytest-cov>=5,<7",
 ]
 
