@@ -44,7 +44,7 @@ jobs:
           git archive --format=zip --prefix="${prefix}/" --output="dist/${prefix}.zip" HEAD
           docker build --build-arg "TEXT2MODEL_FORGE_SOURCE_REVISION=${GITHUB_SHA}" --tag "text2model-forge:${RELEASE_TAG}" .
       - name: Generate source SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           path: .
           artifact-name: text2model-forge-source.spdx.json
@@ -52,7 +52,7 @@ jobs:
           upload-artifact: false
           upload-release-assets: false
       - name: Generate container SBOM
-        uses: anchore/sbom-action@e22c389904149dbc22b58101806040fa8d37a610 # v0.24.0
+        uses: anchore/sbom-action@3ad7283483fc7af8ff2b4ea19663c2d5ca935e26 # v0.24.2
         with:
           image: text2model-forge:${{ github.ref_name }}
           artifact-name: text2model-forge-container.spdx.json
