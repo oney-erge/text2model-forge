@@ -30,7 +30,7 @@ dependencies = [
   "numpy>=1.26,<3",
   "Pillow>=12.3,<13",
   "pydantic>=2.8,<3",
-  "trimesh>=4.4,<5",
+  "trimesh>=4.4,<6",
 ]
 
 [project.optional-dependencies]
