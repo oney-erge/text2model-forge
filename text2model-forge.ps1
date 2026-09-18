@@ -205,8 +205,17 @@ function Test-PythonExecutable {
 function Find-Python {
     $candidates = New-Object System.Collections.Generic.List[string]
     if (Test-Command py) {
+        $previousErrorActionPreference = $ErrorActionPreference
+        $ErrorActionPreference = "Continue"
         $fromLauncher = & py -3.12 -c "import sys; print(sys.executable)" 2>$null
-        if ($LASTEXITCODE -eq 0 -and $fromLauncher) { $candidates.Add($fromLauncher.Trim()) }
+        $launcherExit = $LASTEXITCODE
+        $ErrorActionPreference = $previousErrorActionPreference
+        if ($launcherExit -eq 0 -and $fromLauncher) {
+            $launcherPath = ([string]$fromLauncher).Trim().Trim('"').Trim("'")
+            if (Test-Path -LiteralPath $launcherPath -PathType Leaf) {
+                $candidates.Add($launcherPath)
+            }
+        }
     }
     foreach ($name in @("python", "python3")) {
         $command = Get-Command $name -ErrorAction SilentlyContinue
@@ -218,7 +227,13 @@ function Find-Python {
             ForEach-Object { $candidates.Add($_.FullName) }
     }
     foreach ($candidate in ($candidates | Select-Object -Unique)) {
-        if (Test-PythonExecutable $candidate) { return $candidate }
+        $normalized = [string]$candidate
+        while ($normalized.Length -ge 2 -and
+            (($normalized.StartsWith('"') -and $normalized.EndsWith('"')) -or
+             ($normalized.StartsWith("'") -and $normalized.EndsWith("'")))) {
+            $normalized = $normalized.Substring(1, $normalized.Length - 2).Trim()
+        }
+        if (Test-PythonExecutable $normalized) { return $normalized }
     }
     return $null
 }
@@ -629,8 +644,8 @@ function Show-Doctor {
 
 try {
     if ($Action -eq "doctor") {
-        [void](Show-Doctor)
-        exit 0
+        $doctorReady = Show-Doctor
+        exit $(if ($doctorReady) { 0 } else { 1 })
     }
 
     $selectedStack = Resolve-AiStack

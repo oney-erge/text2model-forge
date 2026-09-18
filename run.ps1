@@ -22,6 +22,16 @@ function Wait-Studio {
     }
     return $false
 }
+function Test-Studio {
+    try { Invoke-WebRequest -UseBasicParsing -Uri "$url/doctor" -TimeoutSec 2 | Out-Null; return $true }
+    catch { return $false }
+}
+
+if ($action -eq "run" -and (Test-Studio)) {
+    Write-Host "Asset Forge Studio is already running at $url" -ForegroundColor Green
+    if (-not $noBrowser) { Start-Process $url }
+    exit 0
+}
 
 if ($action -in @("docker", "stop", "logs")) {
     $dockerReady = $false
