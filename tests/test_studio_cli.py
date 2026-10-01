@@ -24,6 +24,16 @@ from text2model_forge.studio_store import StudioStore
 from test_studio import BlockingControlFakeComfy, DESCRIPTION, FakeComfy, FakeQwen, wait_for
 
 
+def _wait_for_submitted_job(executor: ThreadPoolExecutor) -> None:
+    """Block until submit()'s background job has returned, not just reached
+    the gate. After recording the D1 gate, _drive() makes one more pass
+    before it returns; on a slow runner that pass can see the decision a
+    test records next and start driving D1 itself, racing the test's own
+    writes into StudioConflictError. The executor has one worker, so a
+    no-op submitted now runs only after that job is done."""
+    executor.submit(lambda: None).result(timeout=5)
+
+
 def test_list_runs_reports_every_run_summary(tmp_path: Path) -> None:
     store = StudioStore(tmp_path)
     store.create("run-a", DESCRIPTION)
@@ -56,6 +66,7 @@ def test_decide_records_and_resumes_by_default(tmp_path: Path) -> None:
         store.create("cli-decide-v1", DESCRIPTION)
         assert coordinator.submit("cli-decide-v1")
         run = wait_for(store, "cli-decide-v1", "awaiting_review")
+        _wait_for_submitted_job(executor)
         candidate = next(
             item for item in run.stage("D1").evidence if item.metrics.get("selectable") is True
         )
@@ -89,6 +100,7 @@ def test_decide_with_no_resume_only_records_the_decision(tmp_path: Path) -> None
         store.create("cli-no-resume-v1", DESCRIPTION)
         assert coordinator.submit("cli-no-resume-v1")
         run = wait_for(store, "cli-no-resume-v1", "awaiting_review")
+        _wait_for_submitted_job(executor)
         candidate = next(
             item for item in run.stage("D1").evidence if item.metrics.get("selectable") is True
         )
