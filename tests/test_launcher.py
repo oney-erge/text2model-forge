@@ -94,7 +94,7 @@ def test_docker_setup_is_local_only_persistent_and_uses_typed_config() -> None:
 
 def test_run_wrapper_scripts_forward_to_the_real_launchers_with_a_fast_default_stack() -> None:
     """run.ps1/run.sh exist so this repo is discoverable the same way as the
-    account's other repos (MetaScout, Agentarium both use run.ps1/run.sh).
+    account's other repos (MetaScout, AgentGymnasium both use run.ps1/run.sh).
     They must not duplicate installer logic -- they are a thin front door
     that defaults to the fast core stack and delegates everything else to
     the real, already-tested launcher."""
