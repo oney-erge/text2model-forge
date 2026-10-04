@@ -37,7 +37,7 @@ dependencies = [
 local-ai = [
   # Required by resources/adapters/install_qwen_image_edit_models.py. Keep heavyweight
   # ComfyUI/PyTorch dependencies in ComfyUI's own isolated environment.
-  "huggingface-hub>=0.27,<2",
+  "huggingface-hub>=0.27,<3",
 ]
 dev = [
   "build>=1.3,<2",
