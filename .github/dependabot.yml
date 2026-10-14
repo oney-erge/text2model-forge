@@ -5,6 +5,11 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    # The local-AI installer and hashed locks are qualified for Hub v1.
+    # Widen the range only with a tested downloader/lock migration.
+    ignore:
+      - dependency-name: huggingface-hub
+        update-types: ["version-update:semver-major"]
     groups:
       production-dependencies:
         dependency-type: production
