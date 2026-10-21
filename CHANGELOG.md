@@ -5,6 +5,14 @@ period, minor versions may change experimental worker and UI contracts.
 
 ## [Unreleased]
 
+### Security
+
+- Moved Pillow to 13.0 (`Pillow>=13.0,<14`; 12.3.0 has nine published advisories fixed in 13.0.0) and certifi to
+  2026.10.19. The Security workflow's `dependency-audit` job was failing on these. The hash-checked
+  `requirements*.lock` exports were regenerated with the pinned uv and now match `uv.lock`; they had fallen behind
+  it (numpy 2.5.4, pydantic 2.14.1, trimesh 5.1.1 had been locked but never exported). The 448-test suite passes
+  on this lock and `pip-audit` is clean.
+
 ### Added
 
 - Public-release security, contribution, support, licensing, and release
