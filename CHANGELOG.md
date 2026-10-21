@@ -12,6 +12,8 @@ period, minor versions may change experimental worker and UI contracts.
   `requirements*.lock` exports were regenerated with the pinned uv and now match `uv.lock`; they had fallen behind
   it (numpy 2.5.4, pydantic 2.14.1, trimesh 5.1.1 had been locked but never exported). The 448-test suite passes
   on this lock and `pip-audit` is clean.
+  The pinned TripoSG Windows environment baseline (`resources/environments/`) moves to Pillow 13.0.0 as well;
+  like the rest of that stack it still needs a live qualification run before the worker is promoted.
 
 ### Added
 
