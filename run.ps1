@@ -37,10 +37,10 @@ if ($action -in @("docker", "stop", "logs")) {
     $dockerReady = $false
     $dockerRunning = $false
     if (Get-Command docker -ErrorAction SilentlyContinue) {
-        docker info *> $null
+        $null = Invoke-NativeQuiet docker @("info")
         $dockerReady = $LASTEXITCODE -eq 0
         if ($dockerReady) {
-            $container = docker compose ps --quiet studio 2>$null
+            $container = Invoke-NativeQuiet docker @("compose","ps","--quiet","studio")
             $dockerRunning = -not [string]::IsNullOrWhiteSpace(($container -join ""))
         }
     }
