@@ -20,7 +20,7 @@ WORKDIR /app
 # Text2Model Forge resolves adapters and other resources relative to the checkout,
 # so retain the full source tree and use an editable install inside the image.
 COPY . .
-RUN python -m pip install --no-cache-dir --upgrade "pip==26.2.1" "setuptools==84.0.0" \
+RUN python -m pip install --no-cache-dir --upgrade "pip==26.2.1" "setuptools==84.2.1" \
     && python -m pip install --no-cache-dir --require-hashes -r requirements.lock \
     && python -m pip install --no-cache-dir --no-deps --no-build-isolation -e . \
     && groupadd --gid 10001 text2model \

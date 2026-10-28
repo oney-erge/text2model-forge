@@ -55,7 +55,7 @@ $OllamaInstallerUrl = "https://ollama.com/download/OllamaSetup.exe"
 $SdxlUrl = "https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors"
 $HunyuanUrl = "https://huggingface.co/Comfy-Org/hunyuan3D_2.0_repackaged/resolve/main/split_files/hunyuan3d-dit-v2_fp16.safetensors"
 $PipVersion = "26.2.1"
-$SetuptoolsVersion = "84.0.0"
+$SetuptoolsVersion = "84.2.1"
 
 function Write-Step {
     param([string]$Activity)
