@@ -46,11 +46,13 @@ run the full verification suite:
 ```bash
 python -m pip install "uv==0.11.32"
 uv lock --python 3.12
-uv export --frozen --no-emit-project --format requirements-txt --output-file requirements.lock
-uv export --frozen --extra local-ai --no-emit-project --format requirements-txt --output-file requirements-local-ai.lock
-uv export --frozen --extra dev --no-emit-project --format requirements-txt --output-file requirements-dev.lock
-uv export --frozen --all-extras --no-emit-project --format requirements-txt --output-file requirements-all.lock
+scripts/export-locks.sh
 ```
+
+CI's `locks` job runs the same script and fails if any export differs from
+`uv.lock`. Dependabot only edits `uv.lock`, so the `Dependabot lock exports`
+workflow regenerates the exports on its pull requests and re-runs CI and the
+security audit on the updated branch.
 
 The project itself is then installed with `--no-deps --no-build-isolation` so
 pip cannot silently resolve around the reviewed lock. ComfyUI and PyTorch stay

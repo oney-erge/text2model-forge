@@ -1,0 +1,48 @@
+name: Dependabot lock exports
+
+# Dependabot updates uv.lock but not the hash-checked requirements exports that
+# CI, the audit, the launchers and the container install from. Regenerate them
+# on Dependabot's branch so its pull requests test and audit what they change.
+on:
+  pull_request:
+    paths: [uv.lock]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dependabot-lock-exports-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  regenerate:
+    if: github.actor == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.ref }}
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.11.32"
+      - name: Regenerate exports
+        run: scripts/export-locks.sh
+      - name: Push the exports and re-run checks on the new head
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          if git diff --quiet -- 'requirements*.lock'; then
+            echo "Exports already match uv.lock."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit --quiet -m "Regenerate requirements exports from uv.lock" -- 'requirements*.lock'
+          git push origin "HEAD:${BRANCH}"
+          # Pushes made with GITHUB_TOKEN do not start workflows, so dispatch them.
+          gh workflow run ci.yml --ref "${BRANCH}"
+          gh workflow run security.yml --ref "${BRANCH}"
