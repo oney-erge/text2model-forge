@@ -1,0 +1,11 @@
+{
+  "schema_version": 1,
+  "repository": {"id": "oney-erge/text2model-forge", "owner": "oney-erge", "maintenance": "unclassified", "interfaces": ["browser-ui", "cli"]},
+  "capabilities": ["async-jobs", "local-runtime", "persistent-data", "ml-research"],
+  "components": [{"id": "compiler", "root": "src/text2model_forge"}],
+  "checks": {"studio": {"argv": ["python", "-m", "pytest", "tests/test_studio.py", "-q"], "cwd": ".", "timeout_seconds": 300, "effects": "local-test-files"}},
+  "journeys": [{"id": "brief-review-export", "user_outcome": "Turn a brief into a reviewed asset with traceable evidence", "checks": ["studio"], "additional_evidence_needed": ["approval and downstream invalidation", "offline demo", "live Blender/ComfyUI/GPU worker checks", "browser recovery and accessibility"]}],
+  "state": {"owner": "src/text2model_forge/studio_store.py", "invariant": "Human decisions are evidence-bound and downstream invalidation preserves history."},
+  "evidence": {"status": "not-collected-by-repoctl"},
+  "agent": {"instruction_entry": "AGENTS.md", "command_trust": "external-to-repository"}
+}
