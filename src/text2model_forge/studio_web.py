@@ -1066,6 +1066,18 @@ _DEPENDENCY_ERROR_HINTS = (
 )
 
 
+_LEGACY_RECOVERY_ERRORS = {
+    "Studio stopped between stages; resume is safe.",
+    "The local Studio process stopped before this automatic stage completed.",
+}
+
+
+def _stage_message(stage) -> str:
+    if stage.error in _LEGACY_RECOVERY_ERRORS:
+        return "Check other Studio instances and external workers before resuming from saved state."
+    return stage.message
+
+
 def _error_block(stage) -> str:
     """A failed/blocked stage's raw error, plus what a human can actually do
     about it. Previously this was a bare <pre> of the exception text with no
@@ -1075,6 +1087,8 @@ def _error_block(stage) -> str:
     check /doctor."""
     if not stage.error:
         return ""
+    if stage.error in _LEGACY_RECOVERY_ERRORS:
+        return '<pre class=error>Studio previously marked this run interrupted.</pre>'
     hint = ""
     lowered = stage.error.lower()
     if any(needle in lowered for needle in _DEPENDENCY_ERROR_HINTS):
@@ -1147,7 +1161,7 @@ def _stage_page(store: StudioStore, run_id: str, stage_id: str) -> str:
         f"{_duration_badge(stage)}</p>"
         f'<div class=progress-label><span>Stage progress</span><span>{stage.progress:.0%}</span></div>'
         f'{_progress_bar(stage.progress, label=f"{stage.stage_id} progress")} '
-        f"<p>{html.escape(stage.message)}</p>{error}{live}"
+        f"<p>{html.escape(_stage_message(stage))}</p>{error}{live}"
         f"{_timeline(run, active=stage.stage_id)}</section>"
         '<div class=grid style="margin-top:16px">'
         f'<section class=card><h2>Human decisions</h2>{_decision_history(stage)}</section>'
@@ -1217,7 +1231,7 @@ def _legacy_run_page(store: StudioStore, coordinator: StudioCoordinator, run_id:
         f'<h2><a href="{_stage_url(run.run_id, stage.stage_id)}">{stage.stage_id} — '
         f"{html.escape(stage.label)}</a></h2>"
         + (f'<p>{_duration_badge(stage)}</p>' if stage.started_at else "")
-        + f'<p id=stage-message>{html.escape(stage.message)}</p>{error}{actions}</section>'
+        + f'<p id=stage-message>{html.escape(_stage_message(stage))}</p>{error}{actions}</section>'
         '<div class=grid style="margin-top:16px"><section class=card><h2>Qwen production contract</h2>'
         f"{_spec(run)}</section><section class=card><h2>Qwen gate review</h2>{_qwen_review(stage)}"
         f'<p class=muted><a href="{_stage_url(run.run_id, stage.stage_id)}">'
@@ -1377,7 +1391,7 @@ def _run_page(store: StudioStore, coordinator: StudioCoordinator, run_id: str, c
         f'{html.escape(stage.stage_id)}: {html.escape(stage.label)}</a></h2></div>'
         f'<span class="badge{" needs" if stage.state == "awaiting_review" else ""}">'
         f'{html.escape(stage_status)}</span></div>'
-        f'<p id=stage-message>{html.escape(stage.message)}</p>{error}{resume}'
+        f'<p id=stage-message>{html.escape(_stage_message(stage))}</p>{error}{resume}'
         f'<div class=progress-label><span>Active work</span><span id=stage-work>{work_detail}</span></div>'
         f'{_progress_bar(stage.progress, label=f"{stage.stage_id} progress", bar_id="active-stage-bar")}'
         '<div class=progress-label><span>Last observed GPU memory</span>'
@@ -1407,7 +1421,7 @@ def _run_page(store: StudioStore, coordinator: StudioCoordinator, run_id: str, c
             '<section class=card><div class=section-head><div><p class=eyebrow>Validation</p>'
             f'<h2>{html.escape(stage.stage_id)}: {html.escape(stage.label)}</h2></div>'
             '<span class=badge>Complete</span></div>'
-            f'<p>{html.escape(stage.message)}</p>'
+            f'<p>{html.escape(_stage_message(stage))}</p>'
             f'<p><a href="{_stage_url(run.run_id, stage.stage_id)}">Open the complete D10 record</a></p>'
             '</section>'
         )

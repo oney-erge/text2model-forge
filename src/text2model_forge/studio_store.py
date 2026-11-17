@@ -218,18 +218,21 @@ class StudioStore:
         recovered: list[str] = []
         for run in self.list():
             stage = run.stage(run.current_stage)
+            recovery_marker = "Studio marked this run interrupted"
             interrupted_failure = (
                 run.state == "failed"
                 and stage.error is not None
-                and "local Studio process stopped" in stage.error
+                and ("local Studio process stopped" in stage.error or recovery_marker in stage.error)
             )
             if run.state != "running" and not interrupted_failure:
                 continue
             before = (run.state, stage.state, stage.error, stage.message)
             if stage.state not in {"running", "failed"}:
                 run.state = "failed"
-                stage.error = "Studio stopped between stages; resume is safe."
-                stage.message = "The prior local process stopped. Use Resume to continue from saved state."
+                stage.error = f"{recovery_marker} between stages."
+                stage.message = (
+                    "Check other Studio instances and external workers before resuming from saved state."
+                )
             else:
                 current_candidates = [
                     item
@@ -239,6 +242,16 @@ class StudioStore:
                     and item.media_type.startswith("image/")
                     and "candidate" in item.evidence_id
                 ]
+                if (
+                    interrupted_failure
+                    and stage.state == "failed"
+                    and stage.error == "The local Studio process stopped before this automatic stage completed."
+                    and stage.message == "Use Resume to retry this stage from its persisted inputs and history."
+                    and not (stage.gate_required and current_candidates)
+                ):
+                    # Preserve an already recovered legacy record without adding
+                    # another recovery event merely to rewrite its old guidance.
+                    continue
                 if stage.gate_required and current_candidates:
                     for item in current_candidates:
                         item.metrics["selectable"] = True
@@ -269,8 +282,11 @@ class StudioStore:
                     run.state = "awaiting_review"
                 else:
                     stage.state = "failed"
-                    stage.error = "The local Studio process stopped before this automatic stage completed."
-                    stage.message = "Use Resume to retry this stage from its persisted inputs and history."
+                    stage.error = f"{recovery_marker} before this automatic stage completed."
+                    stage.message = (
+                        "Check other Studio instances and external workers before resuming. "
+                        "Resume retries this stage from its persisted inputs and history."
+                    )
                     run.state = "failed"
             if (run.state, stage.state, stage.error, stage.message) == before:
                 # Already recovered by an earlier start. The message this

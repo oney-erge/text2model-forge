@@ -85,6 +85,8 @@ Studio on a different port can interpret an active run as interrupted; the
 workspace write lock does not establish who owns the running work. After a
 crash, check whether external workers are still running before resuming, since
 saved state alone cannot prove that their side effects stopped.
+Studio's browser shows that guidance for older interruption records as well;
+historical saved records and direct API/CLI output retain their original text.
 
 Every install option, the AI stacks and their license flags, Docker, manual
 installation, Studio and headless control, configuration and verification are
