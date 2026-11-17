@@ -80,6 +80,12 @@ The root launchers share one vocabulary: `run` (the default), `doctor`,
 offline walkthrough with a synthetic sample project, so you can learn the
 interface before downloading any model stack.
 
+Use one active Studio or headless coordinator per workspace. Starting another
+Studio on a different port can interpret an active run as interrupted; the
+workspace write lock does not establish who owns the running work. After a
+crash, check whether external workers are still running before resuming, since
+saved state alone cannot prove that their side effects stopped.
+
 Every install option, the AI stacks and their license flags, Docker, manual
 installation, Studio and headless control, configuration and verification are
 in [docs/setup.md](docs/setup.md).

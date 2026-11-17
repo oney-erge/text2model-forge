@@ -6,10 +6,12 @@ import email
 import html
 import json
 import mimetypes
+import os
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import secrets
+import socket
 from typing import Any, NamedTuple
 from urllib.parse import parse_qs, quote, unquote, urlparse
 import urllib.request
@@ -2192,6 +2194,16 @@ def _golden_dashboard(store: StudioStore) -> str:
         '<code>text2model-forge golden evaluate</code>; the evaluator verifies the stored run evidence and fails closed.</p>'
         '</section><div class=grid style="margin-top:16px">' + "".join(cards) + "</div>"
     )
+class _StudioHTTPServer(ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        if os.name == "nt":
+            # SO_REUSEADDR permits another Windows listener to claim this port.
+            # Keep an accidental second launch from taking over requests.
+            self.allow_reuse_address = False
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
+
+
 class StudioServer(NamedTuple):
     """A constructed but not-yet-running Studio server, plus the pieces a
     caller needs to drive or inspect it. Split out of serve() so the HTTP
@@ -2234,9 +2246,6 @@ def build_server(
             "allow_non_loopback=True is explicitly set"
         )
     store = StudioStore(workspace)
-    recovered = store.recover_interrupted_runs()
-    coordinator = (coordinator_factory or StudioCoordinator)(store)
-    application = StudioApplication(store, coordinator)
     csrf = secrets.token_urlsafe(32)
 
     class Handler(BaseHTTPRequestHandler):
@@ -2539,8 +2548,21 @@ def build_server(
         def log_message(self, format: str, *args: Any) -> None:
             print(f"Text2Model Forge Studio {self.address_string()}: {format % args}")
 
+    server = _StudioHTTPServer((host, port), Handler)
+    coordinator = None
+    try:
+        coordinator = (coordinator_factory or StudioCoordinator)(store)
+        application = StudioApplication(store, coordinator)
+        recovered = store.recover_interrupted_runs()
+    except BaseException:
+        try:
+            if coordinator is not None:
+                coordinator.close()
+        finally:
+            server.server_close()
+        raise
     return StudioServer(
-        server=ThreadingHTTPServer((host, port), Handler),
+        server=server,
         store=store,
         coordinator=coordinator,
         csrf=csrf,
