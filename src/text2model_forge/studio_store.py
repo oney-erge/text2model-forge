@@ -73,33 +73,40 @@ class _WorkspaceMutex:
 
     def __enter__(self):
         self._thread_lock.acquire()
-        depth = getattr(self._local, "depth", 0)
-        if depth == 0:
-            handle = self.lock_path.open("a+b")
-            if handle.tell() == 0:
-                handle.write(b"\0")
-                handle.flush()
-            try:
-                self._lock_file(handle)
-            except Exception:
-                handle.close()
-                self._thread_lock.release()
-                raise
-            self._local.handle = handle
-        self._local.depth = depth + 1
-        return self
+        try:
+            depth = getattr(self._local, "depth", 0)
+            if depth == 0:
+                handle = self.lock_path.open("a+b")
+                try:
+                    if handle.tell() == 0:
+                        handle.write(b"\0")
+                        handle.flush()
+                    self._lock_file(handle)
+                except BaseException:
+                    handle.close()
+                    raise
+                self._local.handle = handle
+            self._local.depth = depth + 1
+            return self
+        except BaseException:
+            self._thread_lock.release()
+            raise
 
     def __exit__(self, exc_type, exc, traceback) -> None:
-        depth = self._local.depth - 1
-        self._local.depth = depth
-        if depth == 0:
-            handle = self._local.handle
-            try:
-                self._unlock_file(handle)
-            finally:
-                handle.close()
-                del self._local.handle
-        self._thread_lock.release()
+        try:
+            depth = self._local.depth - 1
+            self._local.depth = depth
+            if depth == 0:
+                handle = self._local.handle
+                try:
+                    self._unlock_file(handle)
+                finally:
+                    try:
+                        handle.close()
+                    finally:
+                        del self._local.handle
+        finally:
+            self._thread_lock.release()
 
 
 _MUTEX_REGISTRY_LOCK = threading.Lock()
